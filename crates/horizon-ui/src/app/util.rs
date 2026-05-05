@@ -1,3 +1,5 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use egui::{Button, Context, Pos2, Rect, Stroke, Vec2};
 
 use crate::theme;
@@ -45,6 +47,27 @@ pub(super) fn short_session_id(session_id: &str) -> &str {
     session_id.get(..8).unwrap_or(session_id)
 }
 
+pub(super) fn format_relative_time(timestamp_millis: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let timestamp = u128::try_from(timestamp_millis.max(0)).unwrap_or_default();
+    let age = now.saturating_sub(timestamp);
+    let age = Duration::from_millis(u64::try_from(age.min(u128::from(u64::MAX))).unwrap_or(u64::MAX));
+
+    if age < Duration::from_secs(60) {
+        return "active moments ago".to_string();
+    }
+    if age < Duration::from_secs(60 * 60) {
+        return format!("active {}m ago", age.as_secs() / 60);
+    }
+    if age < Duration::from_secs(60 * 60 * 24) {
+        return format!("active {}h ago", age.as_secs() / (60 * 60));
+    }
+    format!("active {}d ago", age.as_secs() / (60 * 60 * 24))
+}
+
 pub(super) fn editor_panel_size_for_file(path: &std::path::Path) -> [f32; 2] {
     const CHAR_W: f32 = 8.0;
     const LINE_H: f32 = 20.0;
@@ -85,12 +108,12 @@ pub(super) fn paint_canvas_glow(ui: &mut egui::Ui) {
     painter.circle_filled(
         Pos2::new(rect.max.x + 48.0, rect.center().y),
         rect.height() * 0.44,
-        theme::CANVAS_WARM_GLOW,
+        theme::CANVAS_WARM_GLOW(),
     );
     painter.circle_filled(
         Pos2::new(rect.min.x - 72.0, rect.min.y + rect.height() * 0.16),
         rect.height() * 0.28,
-        theme::CANVAS_COOL_GLOW,
+        theme::CANVAS_COOL_GLOW(),
     );
 }
 
@@ -150,19 +173,29 @@ pub(super) fn rounded_i32(value: f32) -> i32 {
 }
 
 pub(super) fn primary_button(text: &str) -> Button<'_> {
-    Button::new(egui::RichText::new(text).size(11.5).color(theme::FG))
-        .fill(theme::blend(theme::PANEL_BG_ALT, theme::ACCENT, 0.28))
+    Button::new(egui::RichText::new(text).size(11.5).color(theme::FG()))
+        .fill(theme::blend(theme::PANEL_BG_ALT(), theme::ACCENT(), 0.28))
         .stroke(Stroke::new(
             1.0,
-            theme::blend(theme::BORDER_STRONG, theme::ACCENT, 0.72),
+            theme::blend(theme::BORDER_STRONG(), theme::ACCENT(), 0.72),
         ))
         .corner_radius(10)
 }
 
 pub(super) fn chrome_button(text: &str) -> Button<'_> {
-    Button::new(egui::RichText::new(text).size(11.0).color(theme::FG_SOFT))
-        .fill(theme::PANEL_BG_ALT)
-        .stroke(Stroke::new(1.0, theme::alpha(theme::BORDER_SUBTLE, 210)))
+    Button::new(egui::RichText::new(text).size(11.0).color(theme::FG_SOFT()))
+        .fill(theme::PANEL_BG_ALT())
+        .stroke(Stroke::new(1.0, theme::alpha(theme::BORDER_SUBTLE(), 210)))
+        .corner_radius(10)
+}
+
+pub(super) fn danger_button(text: &str) -> Button<'_> {
+    Button::new(egui::RichText::new(text).size(11.0).color(theme::FG()))
+        .fill(theme::blend(theme::PANEL_BG_ALT(), theme::PALETTE_RED(), 0.22))
+        .stroke(Stroke::new(
+            1.0,
+            theme::blend(theme::BORDER_STRONG(), theme::PALETTE_RED(), 0.68),
+        ))
         .corner_radius(10)
 }
 

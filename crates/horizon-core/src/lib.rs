@@ -13,6 +13,7 @@ pub mod git_status;
 pub mod git_watcher;
 mod horizon_home;
 mod layout;
+mod managed_install;
 mod opencode_paths;
 mod panel;
 mod remote_hosts;
@@ -32,10 +33,10 @@ pub use agents::{AgentDefinition, AgentIntegrationKind, AgentResumeMode, agent_d
 pub use alacritty_terminal::index::Side as TerminalSide;
 pub use alacritty_terminal::selection::SelectionType;
 pub use attention::{AttentionId, AttentionItem, AttentionSeverity, AttentionState};
-pub use board::{Board, ShutdownProgress, WorkspaceLayout};
+pub use board::{Board, ShutdownProgress, WorkspaceDockSide, WorkspaceLayout};
 pub use config::{
-    Config, FeaturesConfig, OverlaysConfig, PresetConfig, ShortcutsConfig, TerminalConfig, WindowConfig,
-    WorkspaceConfig,
+    AppearanceConfig, AppearanceTheme, Config, FeaturesConfig, OverlaysConfig, PresetConfig, ShortcutsConfig,
+    TerminalConfig, WindowConfig, WorkspaceConfig,
 };
 pub use editor::{MarkdownEditor, PanelContent, PreviewMode};
 pub use error::{Error, Result};
@@ -43,8 +44,12 @@ pub use git_changes::DiffViewer;
 pub use git_status::{DiffHunk, DiffLine, DiffLineKind, FileChange, FileDiff, FileStatus, GitStatus};
 pub use git_watcher::GitWatcher;
 pub use horizon_home::HorizonHome;
+pub use managed_install::ManagedInstall;
 pub use panel::{DEFAULT_PANEL_SIZE, Panel, PanelId, PanelKind, PanelLayout, PanelOptions, PanelResume};
-pub use remote_hosts::{RemoteHost, RemoteHostCatalog, RemoteHostSources, RemoteHostStatus, discover_remote_hosts};
+pub use remote_hosts::{
+    RemoteHost, RemoteHostCatalog, RemoteHostConnectionHistoryEntry, RemoteHostConnectionSummary, RemoteHostSources,
+    RemoteHostStatus, discover_remote_hosts, summarize_remote_host_connections,
+};
 pub use runtime_state::{
     AgentSessionBinding, AgentSessionCatalog, AgentSessionRecord, DetachedWorkspaceState, PanelState, PanelTemplateRef,
     RuntimeState, WorkspaceState, WorkspaceTemplateRef, new_local_id,

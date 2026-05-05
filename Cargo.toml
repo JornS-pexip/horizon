@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/horizon-core", "crates/horizon-cursor", "crates/horizon-ui"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.6"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -19,8 +19,8 @@ pedantic = { level = "warn", priority = -1 }
 struct_excessive_bools = "allow"
 
 [workspace.dependencies]
-horizon-core = { path = "crates/horizon-core", version = "0.2.1" }
-horizon-cursor = { path = "crates/horizon-cursor", version = "0.2.1" }
+horizon-core = { path = "crates/horizon-core", version = "0.2.6" }
+horizon-cursor = { path = "crates/horizon-cursor", version = "0.2.6" }
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -28,7 +28,7 @@ profiling = "1.0.17"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
 serde_json = "1.0.149"
-alacritty_terminal = "0.25.1"
+alacritty_terminal = "0.26.0"
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 egui = "0.33.3"
 # Feature-only dependency: eframe/egui-wgpu keep using wgpu 27, so Horizon must
@@ -38,10 +38,12 @@ egui_commonmark = { version = "0.22.0", default-features = false, features = ["p
 winit = "0.30.13"
 tempfile = "3.20.0"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
-uuid = { version = "1.22.0", features = ["serde", "v4"] }
+uuid = { version = "1.23.1", features = ["serde", "v4"] }
 git2 = { version = "0.20", default-features = false }
 regex = "1.12.3"
 arboard = "3.6.1"
+tokio = { version = "1.52.1", features = ["rt", "macros"] }
+surge-core = { git = "https://github.com/fintermobilityas/surge.git", tag = "v1.0.0-beta.16", package = "surge-core" }
 
 [profile.release]
 lto = true

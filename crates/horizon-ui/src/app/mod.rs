@@ -13,11 +13,14 @@ mod persistence;
 mod remote_hosts;
 mod root_chrome;
 mod session;
+mod session_manager;
 mod settings;
+mod shortcut_inventory;
 pub(crate) mod shortcuts;
 mod sidebar;
 mod ssh_upload;
 mod startup_session;
+mod updates;
 pub(crate) mod util;
 mod view;
 mod workspace;
@@ -28,11 +31,11 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-use egui::{Context, Pos2, Rect, Vec2, ViewportId};
+use egui::{Color32, Context, Pos2, Rect, Vec2, ViewportId};
 use horizon_core::{
-    AgentSessionBinding, AgentSessionCatalog, AppShortcuts, Board, CanvasViewState, Config, GitWatcher, PanelId,
-    PresetConfig, RemoteHostCatalog, ResolvedSession, RuntimeState, SessionLease, SessionStore, ShutdownProgress,
-    StartupChooser, StartupDecision, WindowConfig, WorkspaceId,
+    AgentSessionBinding, AgentSessionCatalog, AppShortcuts, AppearanceTheme, Board, CanvasViewState, Config,
+    GitWatcher, ManagedInstall, PanelId, PresetConfig, RemoteHostCatalog, ResolvedSession, RuntimeState, SessionLease,
+    SessionStore, ShutdownProgress, StartupChooser, StartupDecision, WindowConfig, WorkspaceId,
 };
 
 use self::canvas::CanvasGridCache;
@@ -83,7 +86,9 @@ enum CanvasPanSpaceKeyState {
 }
 
 use self::frame_stats::FrameStats;
+use self::session_manager::RuntimeSessionManagerState;
 use self::settings::SettingsEditor;
+use self::updates::{AvailableUpdate, UpdateCheckMessage};
 
 struct StartupBootstrap {
     runtime_state: RuntimeState,
@@ -145,6 +150,8 @@ pub struct HorizonApp {
     panels_to_restart: Vec<PanelId>,
     workspace_assignments: Vec<(PanelId, WorkspaceId)>,
     workspace_creates: Vec<PanelId>,
+    appearance_theme: AppearanceTheme,
+    resolved_theme: theme::ResolvedTheme,
     theme_applied: bool,
     canvas_view: CanvasViewState,
     pan_target: Option<Vec2>,
@@ -158,6 +165,8 @@ pub struct HorizonApp {
     panel_screen_rects: HashMap<PanelId, Rect>,
     terminal_body_screen_rects: HashMap<PanelId, Rect>,
     panel_screen_order: Vec<PanelId>,
+    panel_render_order: Vec<(PanelId, usize)>,
+    workspace_colors: Vec<(WorkspaceId, Color32)>,
     primary_selection: PrimarySelection,
     terminal_grid_cache: HashMap<PanelId, TerminalGridCache>,
     editor_preview_cache: HashMap<PanelId, MarkdownPreviewCache>,
@@ -166,6 +175,7 @@ pub struct HorizonApp {
     workspace_screen_rects: Vec<(WorkspaceId, Rect)>,
     fullscreen_panel: Option<PanelId>,
     sidebar_visible: bool,
+    sidebar_drag_workspace: Option<WorkspaceId>,
     minimap_visible: bool,
     hud_visible: bool,
     renaming_workspace: Option<WorkspaceId>,
@@ -196,6 +206,11 @@ pub struct HorizonApp {
     last_terminal_output_at: Option<Instant>,
     pending_session_rebinds: Vec<(PanelId, AgentSessionBinding)>,
     settings: Option<SettingsEditor>,
+    session_manager: Option<RuntimeSessionManagerState>,
+    managed_install: Option<ManagedInstall>,
+    surge_update_check_rx: Option<Receiver<UpdateCheckMessage>>,
+    surge_available_update: Option<AvailableUpdate>,
+    next_surge_update_check_at: Option<Instant>,
     pending_preset_pick: Option<(Option<WorkspaceId>, [f32; 2], std::time::Instant)>,
     dir_picker: Option<DirPicker>,
     command_palette: Option<CommandPalette>,
@@ -214,6 +229,19 @@ pub struct HorizonApp {
     exit_cleanup_complete: bool,
 }
 
+struct AppBootstrap {
+    config_path: PathBuf,
+    session_store: SessionStore,
+    observed_keyboard_inputs: input::ObservedKeyboardInputs,
+    board: Board,
+    resolved_theme: theme::ResolvedTheme,
+    config_last_mtime: Option<std::time::SystemTime>,
+    managed_install: Option<ManagedInstall>,
+    next_surge_update_check_at: Option<Instant>,
+    shortcuts: AppShortcuts,
+    action_commands_cache: Vec<CommandEntry>,
+}
+
 impl HorizonApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -229,18 +257,64 @@ impl HorizonApp {
         cc.egui_ctx.set_fonts(configure_fonts());
         let mut board = Board::new();
         board.attention_enabled = config.features.attention_feed;
+        let resolved_theme = theme::resolve_theme(config.appearance.theme, cc.egui_ctx.system_theme());
+        theme::set_theme(resolved_theme);
 
         let config_last_mtime = std::fs::metadata(&config_path).ok().and_then(|m| m.modified().ok());
+        let (managed_install, next_surge_update_check_at) = managed_install_state();
 
-        let mut app = Self {
+        let bootstrap = AppBootstrap {
+            config_path,
+            session_store,
+            observed_keyboard_inputs,
+            board,
+            resolved_theme,
+            config_last_mtime,
+            managed_install,
+            next_surge_update_check_at,
+            shortcuts,
+            action_commands_cache,
+        };
+        let mut app = Self::initial_state(config, bootstrap);
+
+        match startup {
+            StartupDecision::Open { session, .. } => app.activate_persistent_session(&session),
+            StartupDecision::Ephemeral { runtime_state } => app.activate_ephemeral_session(&runtime_state),
+            StartupDecision::Choose(chooser) => app.startup_chooser = Some(StartupChooserState::new(chooser)),
+        }
+
+        app.maybe_start_update_check();
+
+        app
+    }
+
+    fn initial_state(config: &Config, bootstrap: AppBootstrap) -> Self {
+        let AppBootstrap {
+            config_path,
+            session_store,
+            observed_keyboard_inputs,
+            board,
+            resolved_theme,
+            config_last_mtime,
+            managed_install,
+            next_surge_update_check_at,
+            shortcuts,
+            action_commands_cache,
+        } = bootstrap;
+
+        Self {
             board,
             panels_to_close: Vec::new(),
             panels_to_restart: Vec::new(),
             workspace_assignments: Vec::new(),
             workspace_creates: Vec::new(),
+            appearance_theme: config.appearance.theme,
+            resolved_theme,
             theme_applied: false,
             panel_screen_rects: HashMap::new(),
             panel_screen_order: Vec::new(),
+            panel_render_order: Vec::new(),
+            workspace_colors: Vec::new(),
             terminal_grid_cache: HashMap::new(),
             editor_preview_cache: HashMap::new(),
             canvas_grid_cache: CanvasGridCache::default(),
@@ -248,6 +322,7 @@ impl HorizonApp {
             workspace_screen_rects: Vec::new(),
             fullscreen_panel: None,
             sidebar_visible: true,
+            sidebar_drag_workspace: None,
             minimap_visible: true,
             hud_visible: false,
             renaming_workspace: None,
@@ -278,6 +353,11 @@ impl HorizonApp {
             last_terminal_output_at: Some(Instant::now()),
             pending_session_rebinds: Vec::new(),
             settings: None,
+            session_manager: None,
+            managed_install,
+            surge_update_check_rx: None,
+            surge_available_update: None,
+            next_surge_update_check_at,
             pending_preset_pick: None,
             dir_picker: None,
             command_palette: None,
@@ -305,16 +385,19 @@ impl HorizonApp {
             config_last_check: None,
             shutdown_progress: None,
             exit_cleanup_complete: false,
-        };
-
-        match startup {
-            StartupDecision::Open { session, .. } => app.activate_persistent_session(&session),
-            StartupDecision::Ephemeral { runtime_state } => app.activate_ephemeral_session(&runtime_state),
-            StartupDecision::Choose(chooser) => app.startup_chooser = Some(StartupChooserState::new(chooser)),
         }
-
-        app
     }
+}
+
+fn managed_install_state() -> (Option<ManagedInstall>, Option<Instant>) {
+    let managed_install = std::env::current_exe()
+        .ok()
+        .and_then(|current_exe| ManagedInstall::discover(&current_exe));
+    let next_surge_update_check_at = managed_install
+        .as_ref()
+        .filter(|install| install.uses_stable_channel() && install.uses_github_releases())
+        .map(|_| Instant::now());
+    (managed_install, next_surge_update_check_at)
 }
 
 fn configure_fonts() -> egui::FontDefinitions {
@@ -343,11 +426,10 @@ fn configure_fonts() -> egui::FontDefinitions {
         include_bytes!("../../assets/fonts/NotoSansSymbols2-Regular.ttf"),
     );
 
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, FONT_INTER.to_owned());
+    let proportional = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+    proportional.insert(0, FONT_INTER.to_owned());
+    proportional.insert(1, FONT_NOTO_CJK.to_owned());
+    proportional.insert(2, FONT_NOTO_SYMBOLS.to_owned());
 
     let monospace = fonts.families.entry(egui::FontFamily::Monospace).or_default();
     monospace.insert(0, FONT_JETBRAINS_MONO.to_owned());
@@ -408,7 +490,7 @@ impl eframe::App for HorizonApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        theme::BG.to_normalized_gamma_f32()
+        theme::bg_for(self.resolved_theme).to_normalized_gamma_f32()
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -447,7 +529,7 @@ mod tests {
     use super::{FONT_INTER, FONT_JETBRAINS_MONO, FONT_NOTO_CJK, FONT_NOTO_SYMBOLS, configure_fonts};
 
     #[test]
-    fn configure_fonts_registers_terminal_fallback_stack() {
+    fn configure_fonts_registers_ui_and_terminal_fallback_stacks() {
         let fonts = configure_fonts();
         let proportional = fonts
             .families
@@ -459,6 +541,8 @@ mod tests {
             .expect("monospace font family");
 
         assert_eq!(proportional.first().map(String::as_str), Some(FONT_INTER));
+        assert_eq!(proportional.get(1).map(String::as_str), Some(FONT_NOTO_CJK));
+        assert_eq!(proportional.get(2).map(String::as_str), Some(FONT_NOTO_SYMBOLS));
         assert_eq!(monospace.first().map(String::as_str), Some(FONT_JETBRAINS_MONO));
         assert_eq!(monospace.get(1).map(String::as_str), Some(FONT_NOTO_CJK));
         assert_eq!(monospace.get(2).map(String::as_str), Some(FONT_NOTO_SYMBOLS));

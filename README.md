@@ -87,7 +87,7 @@ A built-in **git status panel** watches your repo in the background. See changed
 <td>
 
 ### Live Settings Editor
-Open the config with **Ctrl+Shift+,** — a side panel with **YAML syntax highlighting** and live preview. Every change applies instantly to the canvas behind it.
+Open the config with **Ctrl+Shift+,** — a side panel with **YAML syntax highlighting** and live preview. Toggle between **light and dark themes** or follow the system; every change applies instantly to the canvas behind it.
 
 </td>
 </tr>
@@ -113,14 +113,16 @@ Drop a `.md` file onto the canvas or create one from the command palette. **Spli
 
 ### Download (fastest)
 
-Grab the latest binary from [**Releases**](https://github.com/peters/horizon/releases/latest) — no dependencies needed.
+Grab the latest release from [**Releases**](https://github.com/peters/horizon/releases/latest) — no dependencies needed.
 
-| Platform | Asset | |
-|:---------|:------|:-|
-| **Linux** x64 | `horizon-linux-x64.tar.gz` | Extract, `chmod +x`, run |
-| **macOS** arm64 | `horizon-osx-arm64.tar.gz` | Extract, `chmod +x`, run |
-| **macOS** x64 | `horizon-osx-x64.tar.gz` | Extract, `chmod +x`, run |
-| **Windows** x64 | `horizon-windows-x64.exe` | Download and run |
+| Platform | Raw binary | Surge installer | |
+|:---------|:-----------|:----------------|:-|
+| **Linux** x64 | `horizon-linux-x64.tar.gz` | `horizon-installer-linux-x64.bin` | Extract and run, or use the installer for managed stable updates |
+| **macOS** arm64 | `horizon-osx-arm64.tar.gz` | `horizon-installer-osx-arm64.bin` | Extract and run, or use the installer for managed stable updates |
+| **macOS** x64 | `horizon-osx-x64.tar.gz` | `horizon-installer-osx-x64.bin` | Extract and run, or use the installer for managed stable updates |
+| **Windows** x64 | `horizon-windows-x64.exe` | `horizon-installer-win-x64.exe` | Run the raw binary directly, or use the installer for managed stable updates |
+
+Homebrew and other package-manager installs keep using the package manager's own upgrade flow. Horizon only offers the in-app update prompt for installs created by the Surge installer.
 
 ### Homebrew
 
@@ -155,6 +157,18 @@ winget upgrade Peters.Horizon
 winget uninstall Peters.Horizon
 ```
 
+### Snap
+
+Stable releases are also published to the Snap Store on Linux x64 as a classic snap:
+
+```bash
+sudo snap install horizon-ui --classic
+snap refresh horizon-ui
+snap remove horizon-ui
+```
+
+Classic confinement is intentional. Horizon launches host shells and host tools such as `ssh`, `git`, `xdg-open`, `pgrep`, `lsof`, and optional `tailscale` helpers, so a strict sandbox would compromise core workflows.
+
 ### Build from source
 
 ```bash
@@ -183,11 +197,13 @@ Duplicate or overlapping bindings are rejected, including near-conflicts such as
 | **Ctrl+Shift+W** | Focus the active workspace at the current zoom |
 | **Ctrl+Shift+9** | Fit the active workspace into view |
 | **Ctrl+Shift+H** | Open Remote Hosts overlay |
+| **Ctrl+Shift+J** | Open the sessions picker |
 | **Ctrl+Shift+B** | Toggle sidebar |
 | **Ctrl+Shift+U** | Toggle HUD |
 | **Ctrl+Shift+M** | Toggle minimap |
 | **Ctrl+Shift+A** | Align visible attached workspaces into a horizontal row |
 | **Ctrl+Shift+,** | Open settings editor |
+| **Ctrl+Shift+F** | Focus the terminal search bar |
 | **Ctrl+0** | Reset canvas zoom to 100% |
 | **Ctrl+Plus** | Zoom canvas in |
 | **Ctrl+Minus** | Zoom canvas out |
@@ -195,6 +211,9 @@ Duplicate or overlapping bindings are rejected, including near-conflicts such as
 | **Escape** | Exit active panel fullscreen |
 | **Ctrl+Shift+F11** | Toggle window fullscreen |
 | **Ctrl+Shift+S** | Save the active Markdown editor |
+| **Ctrl+Shift+C** | Copy the current terminal selection |
+| **Ctrl+Shift+V** | Paste into the focused terminal |
+| **Ctrl+Shift+R** | Reconnect the focused disconnected SSH panel |
 
 ### Structured Workflow
 
@@ -218,7 +237,7 @@ If you do not want to start by dragging panels around the canvas, use Horizon li
 | **Ctrl+double-click** canvas | Create a new workspace |
 | **Ctrl+double-click** inside a workspace | Add a new terminal |
 
-<sub>On macOS, substitute Cmd for Ctrl.</sub>
+<sub>On macOS, substitute Cmd for Ctrl. Copy and paste use the standard Cmd+C / Cmd+V bindings, and on Windows you can also use Ctrl+Insert / Shift+Insert. The SSH reconnect shortcut is contextual and is disabled if another global shortcut overlaps with Ctrl+Shift+R.</sub>
 
 ---
 
@@ -227,6 +246,9 @@ If you do not want to start by dragging panels around the canvas, use Horizon li
 The settings editor writes back to the same config file Horizon loaded. By default that is `~/.horizon/config.yaml`, and `config.yml` is also supported when discovered or passed explicitly. You can define workspaces, panel presets, feature flags, and keyboard shortcuts:
 
 ```yaml
+appearance:
+  theme: auto # auto, light, or dark
+
 shortcuts:
   command_palette: Ctrl+Shift+K
   new_terminal: Ctrl+Shift+N
@@ -299,7 +321,7 @@ Use key names like `Plus`, `Minus`, `Comma`, `Escape`, and `F11` in YAML instead
 | [**eframe / egui**](https://github.com/emilk/egui) | Immediate-mode UI framework |
 | [**wgpu**](https://wgpu.rs) | GPU rendering — Vulkan, Metal, DX12, OpenGL |
 | [**alacritty_terminal**](https://github.com/alacritty/alacritty) | Battle-tested terminal emulation |
-| [**Catppuccin Mocha**](https://catppuccin.com) | Dark color palette |
+| [**Catppuccin**](https://catppuccin.com) | Terminal palettes (Mocha dark / Latte light) on a warm editorial UI chrome |
 
 ---
 

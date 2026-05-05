@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::attention::AttentionItem;
+use crate::attention::{AttentionItem, AttentionSeverity};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::panel::{Panel, PanelId, PanelKind, PanelProcessOutput};
-use crate::runtime_state::RuntimeState;
+use crate::panel::{Panel, PanelId, PanelKind, PanelOptions, PanelProcessOutput};
+use crate::runtime_state::{PanelState, RuntimeState};
 use crate::workspace::{Workspace, WorkspaceId};
 
 const PANEL_CHROME_PAD: f32 = 8.0;
@@ -29,14 +29,30 @@ fn vec2_eq(left: [f32; 2], right: [f32; 2]) -> bool {
     (left[0] - right[0]).abs() <= f32::EPSILON && (left[1] - right[1]).abs() <= f32::EPSILON
 }
 
+fn panel_restore_options(panel_state: &PanelState, transcript_root: Option<&Path>) -> PanelOptions {
+    let mut options = panel_state.to_panel_options();
+    options.transcript_root = transcript_root.map(Path::to_path_buf);
+    options.restore_as_disconnected_snapshot = transcript_root.is_some() && panel_state.kind == PanelKind::Ssh;
+    options
+}
+
+fn panel_restore_label(panel_state: &PanelState) -> String {
+    if panel_state.name.is_empty() {
+        panel_state.kind.display_name().to_string()
+    } else {
+        format!("'{}'", panel_state.name)
+    }
+}
+
 /// Predefined layout arrangements for panels inside a workspace.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum WorkspaceLayout {
     /// Single column, panels stacked top-to-bottom.
     Rows,
     /// Single row, panels side by side.
     Columns,
     /// Square-ish grid (auto columns).
+    #[default]
     Grid,
 }
 
@@ -51,6 +67,14 @@ impl WorkspaceLayout {
             Self::Grid => "Grid",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceDockSide {
+    Left,
+    Right,
+    Above,
+    Below,
 }
 
 pub struct Board {
@@ -95,7 +119,7 @@ impl Board {
     ///
     /// # Errors
     ///
-    /// Returns an error if any configured panel fails to spawn.
+    /// Returns an error if the generated runtime state cannot be restored.
     pub fn from_config(config: &Config) -> Result<Self> {
         Self::from_runtime_state(&RuntimeState::from_config(config))
     }
@@ -104,7 +128,7 @@ impl Board {
     ///
     /// # Errors
     ///
-    /// Returns an error if any configured panel fails to spawn.
+    /// Returns an error if the runtime state cannot be restored.
     pub fn from_runtime_state(state: &RuntimeState) -> Result<Self> {
         Self::from_runtime_state_with_transcripts(state, None)
     }
@@ -113,18 +137,26 @@ impl Board {
     ///
     /// # Errors
     ///
-    /// Returns an error if any configured panel fails to spawn.
+    /// Returns an error if the runtime state cannot be restored.
     pub fn from_runtime_state_with_transcripts(state: &RuntimeState, transcript_root: Option<&Path>) -> Result<Self> {
         let mut board = Self::new();
 
         for workspace_state in &state.workspaces {
             let ws_id = board.create_workspace_record(workspace_state);
             for panel_state in &workspace_state.panels {
-                let mut options = panel_state.to_panel_options();
-                options.transcript_root = transcript_root.map(Path::to_path_buf);
-                options.restore_as_disconnected_snapshot =
-                    transcript_root.is_some() && panel_state.kind == PanelKind::Ssh;
-                board.create_panel(options, ws_id)?;
+                let options = panel_restore_options(panel_state, transcript_root);
+                if let Err(error) = board.create_panel(options, ws_id) {
+                    board.handle_panel_restore_failure(
+                        &workspace_state.name,
+                        panel_state,
+                        ws_id,
+                        transcript_root,
+                        &error,
+                    );
+                }
+            }
+            if let Some(workspace) = board.workspace_mut(ws_id) {
+                workspace.layout = workspace_state.layout;
             }
         }
 
@@ -146,6 +178,54 @@ impl Board {
         Ok(board)
     }
 
+    fn handle_panel_restore_failure(
+        &mut self,
+        workspace_name: &str,
+        panel_state: &PanelState,
+        workspace_id: WorkspaceId,
+        transcript_root: Option<&Path>,
+        error: &Error,
+    ) {
+        let panel_label = panel_restore_label(panel_state);
+        let error_message = error.to_string();
+        tracing::error!(
+            workspace = %workspace_name,
+            panel = %panel_label,
+            error = %error_message,
+            "failed to restore panel"
+        );
+
+        let options = panel_restore_options(panel_state, transcript_root);
+        match self.create_failed_restore_panel(options, workspace_id, &error_message) {
+            Ok(panel_id) => {
+                self.create_attention(
+                    workspace_id,
+                    Some(panel_id),
+                    "restore",
+                    format!("Failed to restore {panel_label}: {error_message}"),
+                    AttentionSeverity::High,
+                );
+            }
+            Err(placeholder_error) => {
+                tracing::error!(
+                    workspace = %workspace_name,
+                    panel = %panel_label,
+                    error = %placeholder_error,
+                    "failed to create restore failure placeholder"
+                );
+                self.create_attention(
+                    workspace_id,
+                    None,
+                    "restore",
+                    format!(
+                        "Failed to restore {panel_label}: {error_message}. Also failed to show a placeholder: {placeholder_error}"
+                    ),
+                    AttentionSeverity::High,
+                );
+            }
+        }
+    }
+
     /// Restart a panel's terminal process in-place, preserving identity and
     /// session binding.
     ///
@@ -163,9 +243,7 @@ impl Board {
 
     pub fn shutdown_terminal_panels(&mut self) {
         for panel in &mut self.panels {
-            if panel.terminal().is_some() {
-                panel.request_shutdown();
-            }
+            panel.request_shutdown();
         }
 
         for panel in &mut self.panels {
@@ -193,9 +271,7 @@ impl Board {
         let mut terminal_count = 0;
 
         for panel in &mut self.panels {
-            if let Some(terminal) = panel.terminal_mut() {
-                terminal.request_shutdown();
-            }
+            panel.request_shutdown();
         }
 
         for panel in &mut self.panels {

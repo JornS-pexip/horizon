@@ -1,5 +1,3 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use egui::{Align, Color32, Context, CursorIcon, Layout, Margin, RichText, Sense, Stroke};
 use horizon_core::StartupPromptReason;
 
@@ -59,7 +57,7 @@ impl HorizonApp {
         self.restore_window_viewport(ctx);
     }
 
-    fn restore_window_viewport(&self, ctx: &Context) {
+    pub(super) fn restore_window_viewport(&self, ctx: &Context) {
         let width = self.window_config.width.clamp(800.0, 7680.0);
         let height = self.window_config.height.clamp(600.0, 4320.0);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
@@ -73,14 +71,14 @@ fn render_startup_chooser_panel(ctx: &Context, state: &mut StartupChooserState) 
     let mut action = StartupChooserAction::None;
 
     egui::CentralPanel::default()
-        .frame(egui::Frame::default().fill(theme::BG))
+        .frame(egui::Frame::default().fill(theme::BG()))
         .show(ctx, |ui| {
             render_startup_header(ui, state.chooser.reason);
             ui.add_space(24.0);
             ui.centered_and_justified(|ui| {
                 egui::Frame::default()
-                    .fill(theme::BG_ELEVATED)
-                    .stroke(Stroke::new(1.0, theme::BORDER_SUBTLE))
+                    .fill(theme::BG_ELEVATED())
+                    .stroke(Stroke::new(1.0, theme::BORDER_SUBTLE()))
                     .corner_radius(18)
                     .inner_margin(Margin::same(22))
                     .show(ui, |ui| {
@@ -111,7 +109,7 @@ fn render_startup_chooser_panel(ctx: &Context, state: &mut StartupChooserState) 
 fn render_startup_header(ui: &mut egui::Ui, reason: StartupPromptReason) {
     ui.vertical_centered(|ui| {
         ui.add_space(48.0);
-        ui.label(RichText::new("Horizon").size(28.0).strong().color(theme::FG));
+        ui.label(RichText::new("Horizon").size(28.0).strong().color(theme::FG()));
         ui.add_space(10.0);
         ui.label(
             RichText::new(match reason {
@@ -119,16 +117,16 @@ fn render_startup_header(ui: &mut egui::Ui, reason: StartupPromptReason) {
                 StartupPromptReason::MultipleRecoverable => "Multiple recoverable sessions are available.",
             })
             .size(13.0)
-            .color(theme::FG_SOFT),
+            .color(theme::FG_SOFT()),
         );
     });
 }
 
 fn render_config_path(ui: &mut egui::Ui, config_path: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Config").color(theme::FG).strong());
+        ui.label(RichText::new("Config").color(theme::FG()).strong());
         ui.add_space(8.0);
-        ui.label(RichText::new(config_path).monospace().color(theme::FG_DIM));
+        ui.label(RichText::new(config_path).monospace().color(theme::FG_DIM()));
     });
 }
 
@@ -146,16 +144,16 @@ fn render_session_card(ui: &mut egui::Ui, session: &horizon_core::SessionSummary
     let mut radio_clicked = false;
     let frame_response = egui::Frame::default()
         .fill(if selected {
-            theme::blend(theme::PANEL_BG, theme::ACCENT, 0.16)
+            theme::blend(theme::PANEL_BG(), theme::ACCENT(), 0.16)
         } else {
-            theme::PANEL_BG
+            theme::PANEL_BG()
         })
         .stroke(Stroke::new(
             1.0,
             if selected {
-                theme::blend(theme::BORDER_STRONG, theme::ACCENT, 0.75)
+                theme::blend(theme::BORDER_STRONG(), theme::ACCENT(), 0.75)
             } else {
-                theme::BORDER_SUBTLE
+                theme::BORDER_SUBTLE()
             },
         ))
         .corner_radius(14)
@@ -167,10 +165,10 @@ fn render_session_card(ui: &mut egui::Ui, session: &horizon_core::SessionSummary
 
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&session.label).size(15.0).strong().color(theme::FG));
+                        ui.label(RichText::new(&session.label).size(15.0).strong().color(theme::FG()));
                         if session.is_live {
                             ui.add_space(8.0);
-                            ui.label(RichText::new("Live").size(11.0).color(theme::ACCENT).strong());
+                            ui.label(RichText::new("Live").size(11.0).color(theme::ACCENT()).strong());
                         }
                     });
                     ui.label(
@@ -178,10 +176,10 @@ fn render_session_card(ui: &mut egui::Ui, session: &horizon_core::SessionSummary
                             "{} workspaces · {} panels · {}",
                             session.workspace_count,
                             session.panel_count,
-                            format_relative_time(session.last_active_at)
+                            super::util::format_relative_time(session.last_active_at)
                         ))
                         .size(12.0)
-                        .color(theme::FG_SOFT),
+                        .color(theme::FG_SOFT()),
                     );
                 });
             });
@@ -226,25 +224,4 @@ fn render_action_row(ui: &mut egui::Ui, state: &StartupChooserState, action: &mu
             }
         }
     });
-}
-
-fn format_relative_time(timestamp_millis: i64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let timestamp = u128::try_from(timestamp_millis.max(0)).unwrap_or_default();
-    let age = now.saturating_sub(timestamp);
-    let age = Duration::from_millis(u64::try_from(age.min(u128::from(u64::MAX))).unwrap_or(u64::MAX));
-
-    if age < Duration::from_secs(60) {
-        return "active moments ago".to_string();
-    }
-    if age < Duration::from_secs(60 * 60) {
-        return format!("active {}m ago", age.as_secs() / 60);
-    }
-    if age < Duration::from_secs(60 * 60 * 24) {
-        return format!("active {}h ago", age.as_secs() / (60 * 60));
-    }
-    format!("active {}d ago", age.as_secs() / (60 * 60 * 24))
 }

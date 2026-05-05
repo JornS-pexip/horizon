@@ -1,10 +1,11 @@
 use crate::config::Config;
 use crate::error::Result;
+use crate::layout::WS_COLLISION_GAP;
 use crate::panel::{DEFAULT_PANEL_SIZE, Panel, PanelId, PanelOptions};
 use crate::runtime_state::WorkspaceState;
 use crate::workspace::{Workspace, WorkspaceId};
 
-use super::Board;
+use super::{Board, WorkspaceDockSide, vec2_eq};
 
 impl Board {
     #[must_use]
@@ -58,10 +59,36 @@ impl Board {
     /// # Errors
     ///
     /// Returns an error if the underlying PTY-backed panel cannot be spawned.
-    pub fn create_panel(&mut self, mut opts: PanelOptions, workspace: WorkspaceId) -> Result<PanelId> {
+    pub fn create_panel(&mut self, opts: PanelOptions, workspace: WorkspaceId) -> Result<PanelId> {
+        self.create_panel_with(opts, workspace, Panel::spawn)
+    }
+
+    pub(super) fn create_failed_restore_panel(
+        &mut self,
+        opts: PanelOptions,
+        workspace: WorkspaceId,
+        error_message: &str,
+    ) -> Result<PanelId> {
+        self.create_panel_with(opts, workspace, |id, workspace, opts| {
+            Panel::restore_failure(id, workspace, opts, error_message)
+        })
+    }
+
+    fn create_panel_with(
+        &mut self,
+        mut opts: PanelOptions,
+        workspace: WorkspaceId,
+        spawn_panel: impl FnOnce(PanelId, WorkspaceId, PanelOptions) -> Result<Panel>,
+    ) -> Result<PanelId> {
         let id = PanelId(self.next_panel_id);
         self.next_panel_id += 1;
-        let workspace_layout = self.workspace_layout_value(workspace);
+        let explicit_position = opts.position.is_some();
+        if explicit_position {
+            self.set_workspace_layout(workspace, None);
+        }
+        let workspace_layout = (!explicit_position)
+            .then(|| self.workspace_layout_value(workspace))
+            .flatten();
         let previous_frame = self.workspace_frame_rect(workspace);
 
         // Inherit workspace cwd if the panel doesn't specify one.
@@ -73,7 +100,7 @@ impl Board {
 
         let layout_position = opts.position.unwrap_or_else(|| self.default_panel_position(workspace));
         let layout_size = opts.size.unwrap_or(DEFAULT_PANEL_SIZE);
-        let mut panel = Panel::spawn(id, workspace, opts)?;
+        let mut panel = spawn_panel(id, workspace, opts)?;
         panel.move_to(layout_position);
         panel.resize_layout(layout_size);
         self.panels.push(panel);
@@ -282,6 +309,71 @@ impl Board {
         false
     }
 
+    pub fn move_workspace_beside(&mut self, id: WorkspaceId, anchor_id: WorkspaceId, side: WorkspaceDockSide) -> bool {
+        let workspace_ids: Vec<_> = self.workspaces.iter().map(|workspace| workspace.id).collect();
+        self.move_workspace_beside_in_scope(id, anchor_id, side, &workspace_ids)
+    }
+
+    pub fn move_workspace_beside_in_scope(
+        &mut self,
+        id: WorkspaceId,
+        anchor_id: WorkspaceId,
+        side: WorkspaceDockSide,
+        workspace_ids: &[WorkspaceId],
+    ) -> bool {
+        if id == anchor_id {
+            return false;
+        }
+        if !workspace_ids.contains(&id) || !workspace_ids.contains(&anchor_id) {
+            return false;
+        }
+
+        let Some(source_frame) = self.workspace_frame_rect(id) else {
+            return false;
+        };
+        let Some(anchor_frame) = self.workspace_frame_rect(anchor_id) else {
+            return false;
+        };
+
+        let source_width = source_frame[2] - source_frame[0];
+        let source_height = source_frame[3] - source_frame[1];
+        let desired_frame_min = match side {
+            WorkspaceDockSide::Left => [anchor_frame[0] - source_width - WS_COLLISION_GAP, anchor_frame[1]],
+            WorkspaceDockSide::Right => [anchor_frame[2] + WS_COLLISION_GAP, anchor_frame[1]],
+            WorkspaceDockSide::Above => [anchor_frame[0], anchor_frame[1] - source_height - WS_COLLISION_GAP],
+            WorkspaceDockSide::Below => [anchor_frame[0], anchor_frame[3] + WS_COLLISION_GAP],
+        };
+        let delta = [
+            desired_frame_min[0] - source_frame[0],
+            desired_frame_min[1] - source_frame[1],
+        ];
+
+        if vec2_eq(delta, [0.0, 0.0]) {
+            return false;
+        }
+
+        if !self.translate_workspace(id, delta) {
+            return false;
+        }
+
+        let drag_dir = match side {
+            WorkspaceDockSide::Left => [-1.0, 0.0],
+            WorkspaceDockSide::Right => [1.0, 0.0],
+            WorkspaceDockSide::Above => [0.0, -1.0],
+            WorkspaceDockSide::Below => [0.0, 1.0],
+        };
+        self.push_workspace_colliders_in_direction_in_scope(&[anchor_id, id], drag_dir, workspace_ids);
+        true
+    }
+
+    pub fn move_workspace_before(&mut self, id: WorkspaceId, anchor_id: WorkspaceId) -> bool {
+        self.reorder_workspace_relative(id, anchor_id, false)
+    }
+
+    pub fn move_workspace_after(&mut self, id: WorkspaceId, anchor_id: WorkspaceId) -> bool {
+        self.reorder_workspace_relative(id, anchor_id, true)
+    }
+
     pub fn translate_workspace(&mut self, id: WorkspaceId, delta: [f32; 2]) -> bool {
         if delta == [0.0, 0.0] {
             return false;
@@ -341,5 +433,25 @@ impl Board {
         }
         self.retained_empty_workspaces.remove(&id);
         id
+    }
+
+    fn reorder_workspace_relative(&mut self, id: WorkspaceId, anchor_id: WorkspaceId, insert_after: bool) -> bool {
+        if id == anchor_id {
+            return false;
+        }
+
+        let Some(source_index) = self.workspaces.iter().position(|workspace| workspace.id == id) else {
+            return false;
+        };
+
+        let source_workspace = self.workspaces.remove(source_index);
+        let Some(anchor_index) = self.workspaces.iter().position(|workspace| workspace.id == anchor_id) else {
+            self.workspaces.insert(source_index, source_workspace);
+            return false;
+        };
+
+        let insert_index = anchor_index + usize::from(insert_after);
+        self.workspaces.insert(insert_index, source_workspace);
+        true
     }
 }

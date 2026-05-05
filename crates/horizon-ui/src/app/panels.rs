@@ -5,14 +5,23 @@ use super::super::editor_widget::{MarkdownEditorView, MarkdownPreviewCache};
 use super::super::git_changes_widget::GitChangesView;
 use super::super::input::TerminalInputEvent;
 use super::super::primary_selection::PrimarySelection;
-use super::super::terminal_widget::{TerminalGridCache, TerminalView, viewport_for_available_space};
+use super::super::terminal_widget::{
+    TerminalGridCache, TerminalKeyboardContext, TerminalView, viewport_for_available_space,
+};
 use super::super::theme;
 use super::super::usage_widget::UsageDashboardView;
 pub(super) use super::panel_chrome::{
     PanelChrome, paint_panel_chrome, panel_kind_icon, panel_title_content_rect, show_inline_rename_editor,
 };
+use super::shortcut_inventory::ssh_reconnect_shortcut_conflicts;
 use super::util::clamp_panel_size;
 use super::{HorizonApp, PANEL_PADDING, PANEL_TITLEBAR_HEIGHT, RESIZE_HANDLE_SIZE, RenameEditAction};
+
+#[derive(Clone, Copy)]
+pub(in crate::app) struct PanelScreenGeometry {
+    pub(in crate::app) screen_rect: Rect,
+    pub(in crate::app) terminal_body_screen_rect: Option<Rect>,
+}
 
 struct PanelSnapshot {
     screen_rect: Rect,
@@ -20,8 +29,6 @@ struct PanelSnapshot {
     canvas_position: Pos2,
     canvas_size: Vec2,
     current_workspace_id: WorkspaceId,
-    title: String,
-    display_title: String,
     kind: PanelKind,
     history_size: usize,
     scrollback_limit: usize,
@@ -94,7 +101,9 @@ struct PanelBodyContext<'a> {
     keyboard_events: &'a [TerminalInputEvent],
     editor_save_shortcut: ShortcutBinding,
     editor_preview_cache: Option<&'a mut MarkdownPreviewCache>,
+    local_ssh_reconnect_enabled: bool,
     primary_selection: &'a PrimarySelection,
+    reconnect_requested: &'a mut bool,
     terminal_grid_cache: Option<&'a mut TerminalGridCache>,
 }
 
@@ -117,21 +126,87 @@ fn show_panel_body_contents(
             ui,
             is_focused,
             interactive,
-            body_context.keyboard_events,
-            body_context.primary_selection,
+            TerminalKeyboardContext {
+                keyboard_events: body_context.keyboard_events,
+                primary_selection: body_context.primary_selection,
+                local_ssh_reconnect_enabled: body_context.local_ssh_reconnect_enabled,
+                reconnect_requested: body_context.reconnect_requested,
+            },
         ),
     }
 }
 
+fn clip_screen_rect_to_canvas(raw_rect: Rect, canvas_rect: Rect) -> Option<Rect> {
+    let clipped = raw_rect.intersect(canvas_rect);
+    (clipped.is_positive()
+        && clipped.min.x.is_finite()
+        && clipped.min.y.is_finite()
+        && clipped.max.x.is_finite()
+        && clipped.max.y.is_finite())
+    .then_some(clipped)
+}
+
 impl HorizonApp {
+    fn local_ssh_reconnect_shortcut_enabled(&self) -> bool {
+        !ssh_reconnect_shortcut_conflicts(&self.shortcuts)
+    }
+
+    pub(in crate::app) fn visible_panel_geometry_for_canvas_view(
+        &self,
+        canvas_rect: Rect,
+        visible_workspace: Option<WorkspaceId>,
+    ) -> Vec<(PanelId, PanelScreenGeometry)> {
+        self.board
+            .panels
+            .iter()
+            .filter(|panel| match visible_workspace {
+                Some(workspace_id) => panel.workspace_id == workspace_id,
+                None => !self.workspace_is_detached(panel.workspace_id),
+            })
+            .filter_map(|panel| {
+                self.panel_screen_geometry(panel, canvas_rect)
+                    .map(|geometry| (panel.id, geometry))
+            })
+            .collect()
+    }
+
+    fn panel_screen_geometry(&self, panel: &Panel, canvas_rect: Rect) -> Option<PanelScreenGeometry> {
+        let canvas_position = Pos2::new(panel.layout.position[0], panel.layout.position[1]);
+        let canvas_size = Vec2::new(panel.layout.size[0], panel.layout.size[1]);
+        let screen_rect = clip_screen_rect_to_canvas(
+            Rect::from_min_size(
+                self.canvas_to_screen(canvas_rect, canvas_position),
+                self.canvas_size_to_screen(canvas_size),
+            ),
+            canvas_rect,
+        )?;
+        let terminal_body_screen_rect = panel.terminal().and_then(|_| {
+            let panel_rect = Rect::from_min_size(canvas_position, canvas_size);
+            let body_rect = PanelFrame::new(panel_rect).body;
+            clip_screen_rect_to_canvas(
+                Rect::from_min_size(
+                    self.canvas_to_screen(canvas_rect, body_rect.min),
+                    self.canvas_size_to_screen(body_rect.size()),
+                ),
+                canvas_rect,
+            )
+        });
+
+        Some(PanelScreenGeometry {
+            screen_rect,
+            terminal_body_screen_rect,
+        })
+    }
+
     #[profiling::function]
     pub(super) fn render_fullscreen_panel(&mut self, ctx: &Context) {
         let Some(panel_id) = self.fullscreen_panel else {
             return;
         };
+        let local_ssh_reconnect_enabled = self.local_ssh_reconnect_shortcut_enabled();
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(theme::PANEL_BG))
+            .frame(egui::Frame::default().fill(theme::PANEL_BG()))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let body_rect = Rect::from_min_max(
@@ -144,6 +219,7 @@ impl HorizonApp {
                         .max_rect(body_rect)
                         .layout(Layout::top_down(Align::Min)),
                     |ui| {
+                        let mut reconnect_requested = false;
                         if let Some(panel) = self.board.panel_mut(panel_id) {
                             let preview_cache = if panel.kind == PanelKind::Editor {
                                 Some(self.editor_preview_cache.entry(panel_id).or_default())
@@ -159,10 +235,15 @@ impl HorizonApp {
                                     keyboard_events: &self.terminal_keyboard_events,
                                     editor_save_shortcut: self.shortcuts.save_editor,
                                     editor_preview_cache: preview_cache,
+                                    local_ssh_reconnect_enabled,
                                     primary_selection: &self.primary_selection,
+                                    reconnect_requested: &mut reconnect_requested,
                                     terminal_grid_cache: None,
                                 },
                             );
+                        }
+                        if reconnect_requested {
+                            self.panels_to_restart.push(panel_id);
                         }
                     },
                 );
@@ -176,39 +257,39 @@ impl HorizonApp {
         self.panel_screen_order.clear();
         let workspace_collision_ids = self.workspace_collision_scope(None);
 
-        let workspaces: Vec<(WorkspaceId, String, Color32)> = self
-            .board
-            .workspaces
-            .iter()
-            .map(|workspace| {
+        // Reuse workspace color vec across frames (avoids per-frame String
+        // clones — names are looked up lazily in the context menu).
+        self.workspace_colors.clear();
+        self.workspace_colors
+            .extend(self.board.workspaces.iter().map(|workspace| {
                 let (r, g, b) = workspace.accent();
-                (workspace.id, workspace.name.clone(), Color32::from_rgb(r, g, b))
-            })
-            .collect();
+                (workspace.id, Color32::from_rgb(r, g, b))
+            }));
 
-        let mut panel_order: Vec<_> = self
-            .board
-            .panels
-            .iter()
-            .filter(|panel| !self.workspace_is_detached(panel.workspace_id))
-            .enumerate()
-            .map(|(index, panel)| (panel.id, index))
-            .collect();
+        // Reuse panel ordering vec across frames. Collect into a local first,
+        // then swap into the field, because the filter borrows self immutably
+        // while extend borrows panel_render_order mutably.
+        let mut order = std::mem::take(&mut self.panel_render_order);
+        order.clear();
+        order.extend(
+            self.board
+                .panels
+                .iter()
+                .filter(|panel| !self.workspace_is_detached(panel.workspace_id))
+                .enumerate()
+                .map(|(index, panel)| (panel.id, index)),
+        );
+        self.panel_render_order = order;
         let focused = self.board.focused;
-        panel_order.sort_by_key(|(panel_id, _)| Some(*panel_id) == focused);
+        self.panel_render_order
+            .sort_by_key(|(panel_id, _)| Some(*panel_id) == focused);
 
         let canvas_rect = self.canvas_rect(ctx);
         let mut panels_to_close = Vec::new();
 
-        for (panel_id, fallback_index) in panel_order {
-            if self.render_panel(
-                ctx,
-                canvas_rect,
-                panel_id,
-                fallback_index,
-                &workspaces,
-                &workspace_collision_ids,
-            ) {
+        for i in 0..self.panel_render_order.len() {
+            let (panel_id, fallback_index) = self.panel_render_order[i];
+            if self.render_panel(ctx, canvas_rect, panel_id, fallback_index, &workspace_collision_ids) {
                 panels_to_close.push(panel_id);
             }
         }
@@ -223,50 +304,28 @@ impl HorizonApp {
         canvas_rect: Rect,
         panel_id: PanelId,
         _fallback_index: usize,
-        workspaces: &[(WorkspaceId, String, Color32)],
         workspace_collision_ids: &[WorkspaceId],
     ) -> bool {
-        let Some(snapshot) = self.panel_snapshot(panel_id, canvas_rect, workspaces) else {
+        let Some(snapshot) = self.panel_snapshot(panel_id, canvas_rect) else {
             return false;
         };
-        let outcome = self.show_panel_area(ctx, canvas_rect, panel_id, &snapshot, workspaces);
+        let outcome = self.show_panel_area(ctx, canvas_rect, panel_id, &snapshot);
         self.apply_panel_outcome(ctx, panel_id, &snapshot, &outcome, workspace_collision_ids)
     }
 
     #[profiling::function]
-    fn panel_snapshot(
-        &self,
-        panel_id: PanelId,
-        canvas_rect: Rect,
-        workspaces: &[(WorkspaceId, String, Color32)],
-    ) -> Option<PanelSnapshot> {
+    fn panel_snapshot(&self, panel_id: PanelId, canvas_rect: Rect) -> Option<PanelSnapshot> {
         self.board.panel(panel_id).and_then(|panel| {
+            let geometry = self.panel_screen_geometry(panel, canvas_rect)?;
             let terminal = panel.terminal();
             let canvas_position = Pos2::new(panel.layout.position[0], panel.layout.position[1]);
             let canvas_size = Vec2::new(panel.layout.size[0], panel.layout.size[1]);
-            let screen_rect = Rect::from_min_size(
-                self.canvas_to_screen(canvas_rect, canvas_position),
-                self.canvas_size_to_screen(canvas_size),
-            );
-            let terminal_body_screen_rect = terminal.and_then(|_| {
-                let panel_rect = Rect::from_min_size(canvas_position, canvas_size);
-                let body_rect = PanelFrame::new(panel_rect).body;
-                let screen_body_rect = Rect::from_min_size(
-                    self.canvas_to_screen(canvas_rect, body_rect.min),
-                    self.canvas_size_to_screen(body_rect.size()),
-                );
-                screen_body_rect.is_positive().then_some(screen_body_rect)
-            });
 
-            // Cull off-screen panels — skip chrome, snapshot, and rendering.
-            if !canvas_rect.intersects(screen_rect) {
-                return None;
-            }
-
-            let workspace_accent = workspaces
+            let workspace_accent = self
+                .workspace_colors
                 .iter()
-                .find(|(workspace_id, _, _)| *workspace_id == panel.workspace_id)
-                .map(|(_, _, color)| *color);
+                .find(|(workspace_id, _)| *workspace_id == panel.workspace_id)
+                .map(|(_, color)| *color);
 
             let attention_badge = if self.template_config.features.attention_feed {
                 self.board
@@ -277,13 +336,11 @@ impl HorizonApp {
             };
 
             Some(PanelSnapshot {
-                screen_rect,
-                terminal_body_screen_rect,
+                screen_rect: geometry.screen_rect,
+                terminal_body_screen_rect: geometry.terminal_body_screen_rect,
                 canvas_position,
                 canvas_size,
                 current_workspace_id: panel.workspace_id,
-                title: panel.title.clone(),
-                display_title: panel.display_title().into_owned(),
                 kind: panel.kind,
                 history_size: terminal.map_or(0, horizon_core::Terminal::history_size),
                 scrollback_limit: terminal.map_or(0, horizon_core::Terminal::scrollback_limit),
@@ -303,10 +360,10 @@ impl HorizonApp {
         canvas_rect: Rect,
         panel_id: PanelId,
         snapshot: &PanelSnapshot,
-        workspaces: &[(WorkspaceId, String, Color32)],
     ) -> PanelUiOutcome {
         let mut outcome = PanelUiOutcome::default();
         let interactive = !self.canvas_pan_input_claimed;
+        let local_ssh_reconnect_enabled = self.local_ssh_reconnect_shortcut_enabled();
 
         egui::Area::new(Id::new(("panel", panel_id.0)))
             .fixed_pos(snapshot.canvas_position)
@@ -360,10 +417,19 @@ impl HorizonApp {
                         panel_id,
                         snapshot.current_workspace_id,
                         snapshot.kind,
-                        workspaces,
                         &mut outcome,
                     );
                 }
+
+                // Compute display_title from the board on demand, avoiding a
+                // per-panel String clone in PanelSnapshot. The Cow is borrowed
+                // when the underlying panel title is sufficient, and only
+                // allocates when a formatted composite title is needed.
+                let display_title = if snapshot.is_renaming {
+                    None
+                } else {
+                    self.board.panel(panel_id).map(|p| p.display_title())
+                };
 
                 paint_panel_chrome(
                     ui,
@@ -374,11 +440,7 @@ impl HorizonApp {
                         titlebar_rect: rects.titlebar,
                         close_rect: rects.close,
                         resize_rect: rects.resize,
-                        title: if snapshot.is_renaming {
-                            None
-                        } else {
-                            Some(snapshot.display_title.as_str())
-                        },
+                        title: display_title.as_deref(),
                         history_size: snapshot.history_size,
                         scrollback_limit: snapshot.scrollback_limit,
                         focused: snapshot.is_focused,
@@ -388,6 +450,9 @@ impl HorizonApp {
                         ssh_status: snapshot.ssh_status,
                     },
                 );
+
+                // Release the shared board borrow before the mutable borrow below.
+                drop(display_title);
 
                 if snapshot.is_renaming {
                     outcome.rename_action = show_inline_rename_editor(
@@ -403,6 +468,7 @@ impl HorizonApp {
                         .max_rect(rects.body)
                         .layout(Layout::top_down(Align::Min)),
                     |ui| {
+                        let mut reconnect_requested = false;
                         let board = &mut self.board;
                         let editor_preview_cache = &mut self.editor_preview_cache;
                         let terminal_grid_cache = &mut self.terminal_grid_cache;
@@ -426,10 +492,15 @@ impl HorizonApp {
                                     keyboard_events: &self.terminal_keyboard_events,
                                     editor_save_shortcut: self.shortcuts.save_editor,
                                     editor_preview_cache: preview_cache,
+                                    local_ssh_reconnect_enabled,
                                     primary_selection: &self.primary_selection,
+                                    reconnect_requested: &mut reconnect_requested,
                                     terminal_grid_cache: grid_cache,
                                 },
                             );
+                        }
+                        if reconnect_requested {
+                            self.panels_to_restart.push(panel_id);
                         }
                     },
                 );
@@ -475,26 +546,34 @@ impl HorizonApp {
         panel_id: PanelId,
         current_workspace_id: WorkspaceId,
         kind: PanelKind,
-        workspaces: &[(WorkspaceId, String, Color32)],
         outcome: &mut PanelUiOutcome,
     ) {
         drag_response.context_menu(|ui| {
             ui.set_min_width(180.0);
-            ui.label(egui::RichText::new("Move to Workspace").size(11.0).color(theme::FG_DIM));
+            ui.label(
+                egui::RichText::new("Move to Workspace")
+                    .size(11.0)
+                    .color(theme::FG_DIM()),
+            );
             ui.separator();
 
-            for (workspace_id, workspace_name, workspace_color) in workspaces {
-                let is_current = current_workspace_id == *workspace_id;
+            // Look up workspace names lazily — this closure only runs when the
+            // context menu is actually open, so the per-workspace iteration and
+            // formatting cost is not paid on every frame.
+            for workspace in &self.board.workspaces {
+                let (r, g, b) = workspace.accent();
+                let workspace_color = Color32::from_rgb(r, g, b);
+                let is_current = current_workspace_id == workspace.id;
                 let label = if is_current {
-                    format!("● {workspace_name}")
+                    format!("● {}", workspace.name)
                 } else {
-                    format!("  {workspace_name}")
+                    format!("  {}", workspace.name)
                 };
                 let text = egui::RichText::new(label)
-                    .color(if is_current { *workspace_color } else { theme::FG_SOFT })
+                    .color(if is_current { workspace_color } else { theme::FG_SOFT() })
                     .size(12.0);
                 if ui.add(egui::Button::new(text).frame(false)).clicked() {
-                    outcome.workspace_assignment = Some(*workspace_id);
+                    outcome.workspace_assignment = Some(workspace.id);
                     ui.close();
                 }
             }
@@ -507,8 +586,8 @@ impl HorizonApp {
                 ui.menu_button("Rebind Session", |ui| {
                     ui.set_min_width(220.0);
                     for (label, binding) in &rebind_options {
-                        let button =
-                            egui::Button::new(egui::RichText::new(label).size(12.0).color(theme::FG_SOFT)).frame(false);
+                        let button = egui::Button::new(egui::RichText::new(label).size(12.0).color(theme::FG_SOFT()))
+                            .frame(false);
                         if ui.add(button).clicked() {
                             self.pending_session_rebinds.push((panel_id, binding.clone()));
                             ui.close();
@@ -549,7 +628,9 @@ impl HorizonApp {
         if matches!(outcome.command, Some(PanelCommand::StartRename)) {
             self.clear_workspace_rename();
             self.renaming_panel = Some(panel_id);
-            self.panel_rename_buffer.clone_from(&snapshot.title);
+            if let Some(panel) = self.board.panel(panel_id) {
+                self.panel_rename_buffer.clone_from(&panel.title);
+            }
         }
 
         match outcome.rename_action {
@@ -609,5 +690,30 @@ impl HorizonApp {
         }
 
         matches!(outcome.command, Some(PanelCommand::Close))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clip_screen_rect_to_canvas;
+    use egui::{Pos2, Rect, Vec2};
+
+    #[test]
+    fn clip_screen_rect_to_canvas_intersects_with_canvas_bounds() {
+        let canvas_rect = Rect::from_min_max(Pos2::new(100.0, 80.0), Pos2::new(420.0, 320.0));
+        let raw_rect = Rect::from_min_max(Pos2::new(60.0, 40.0), Pos2::new(180.0, 180.0));
+
+        assert_eq!(
+            clip_screen_rect_to_canvas(raw_rect, canvas_rect),
+            Some(Rect::from_min_max(Pos2::new(100.0, 80.0), Pos2::new(180.0, 180.0)))
+        );
+    }
+
+    #[test]
+    fn clip_screen_rect_to_canvas_rejects_non_positive_intersections() {
+        let canvas_rect = Rect::from_min_size(Pos2::new(100.0, 80.0), Vec2::new(320.0, 240.0));
+        let raw_rect = Rect::from_min_size(Pos2::new(430.0, 90.0), Vec2::new(80.0, 80.0));
+
+        assert_eq!(clip_screen_rect_to_canvas(raw_rect, canvas_rect), None);
     }
 }

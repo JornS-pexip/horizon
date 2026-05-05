@@ -172,7 +172,7 @@ impl HorizonApp {
 
         let canvas_rect = detached_canvas_rect(ctx);
         let workspace_bounds = self.board.workspace_bounds_map();
-        self.handle_canvas_pan_in_rect(ctx, canvas_rect);
+        self.handle_canvas_pan_in_rect(ctx, canvas_rect, Some(workspace_id));
         self.render_canvas(ctx);
         self.render_detached_workspace_backgrounds(ctx, &workspace_bounds, canvas_rect, workspace_id);
         self.render_panels_for_workspace(ctx, workspace_id);
@@ -242,21 +242,26 @@ impl HorizonApp {
         TopBottomPanel::top(egui::Id::new(("detached_workspace_toolbar", workspace_local_id))).show(ctx, |ui| {
             ui.set_height(TOOLBAR_HEIGHT);
             ui.painter()
-                .rect_filled(ui.max_rect(), CornerRadius::ZERO, theme::TITLEBAR_BG);
+                .rect_filled(ui.max_rect(), CornerRadius::ZERO, theme::TITLEBAR_BG());
             ui.painter().line_segment(
                 [
                     Pos2::new(ui.max_rect().min.x, ui.max_rect().max.y),
                     Pos2::new(ui.max_rect().max.x, ui.max_rect().max.y),
                 ],
-                Stroke::new(1.0, theme::alpha(theme::BORDER_SUBTLE, 170)),
+                Stroke::new(1.0, theme::alpha(theme::BORDER_SUBTLE(), 170)),
             );
 
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                ui.label(egui::RichText::new(workspace_name).color(theme::FG).size(13.5).strong());
+                ui.label(
+                    egui::RichText::new(workspace_name)
+                        .color(theme::FG())
+                        .size(13.5)
+                        .strong(),
+                );
                 ui.label(
                     egui::RichText::new("Detached Workspace")
-                        .color(theme::FG_DIM)
+                        .color(theme::FG_DIM())
                         .size(10.5),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -265,7 +270,7 @@ impl HorizonApp {
                             Button::new(
                                 egui::RichText::new("Attach to Main Window")
                                     .size(11.5)
-                                    .color(theme::FG_SOFT),
+                                    .color(theme::FG_SOFT()),
                             )
                             .frame(false),
                         )
@@ -335,15 +340,12 @@ impl HorizonApp {
         self.panel_screen_order.clear();
         let workspace_collision_ids = self.workspace_collision_scope(Some(workspace_id));
 
-        let workspaces: Vec<_> = self
-            .board
-            .workspaces
-            .iter()
-            .map(|workspace| {
+        self.workspace_colors.clear();
+        self.workspace_colors
+            .extend(self.board.workspaces.iter().map(|workspace| {
                 let (r, g, b) = workspace.accent();
-                (workspace.id, workspace.name.clone(), Color32::from_rgb(r, g, b))
-            })
-            .collect();
+                (workspace.id, Color32::from_rgb(r, g, b))
+            }));
 
         let mut panel_ids = self
             .board
@@ -356,14 +358,7 @@ impl HorizonApp {
         let canvas_rect = detached_canvas_rect(ctx);
         self.panels_to_close.clear();
         for (fallback_index, panel_id) in panel_ids.into_iter().enumerate() {
-            if self.render_panel(
-                ctx,
-                canvas_rect,
-                panel_id,
-                fallback_index,
-                &workspaces,
-                &workspace_collision_ids,
-            ) {
+            if self.render_panel(ctx, canvas_rect, panel_id, fallback_index, &workspace_collision_ids) {
                 self.panels_to_close.push(panel_id);
             }
         }

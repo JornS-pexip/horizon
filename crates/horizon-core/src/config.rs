@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub window: WindowConfig,
     #[serde(default)]
+    pub appearance: AppearanceConfig,
+    #[serde(default)]
     pub shortcuts: ShortcutsConfig,
     #[serde(default)]
     pub overlays: OverlaysConfig,
@@ -39,11 +41,35 @@ impl Default for Config {
         Self {
             version: CURRENT_CONFIG_VERSION,
             window: WindowConfig::default(),
+            appearance: AppearanceConfig::default(),
             shortcuts: ShortcutsConfig::default(),
             overlays: OverlaysConfig::default(),
             features: FeaturesConfig::default(),
             presets: default_presets(),
             workspaces: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearanceTheme {
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AppearanceConfig {
+    pub theme: AppearanceTheme,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            theme: AppearanceTheme::Auto,
         }
     }
 }
@@ -106,27 +132,20 @@ impl Default for WindowConfig {
     }
 }
 
-pub(crate) fn default_opencode_presets() -> [PresetConfig; 2] {
-    [
-        PresetConfig {
-            name: "OpenCode".to_string(),
-            alias: Some("oc".to_string()),
-            kind: PanelKind::OpenCode,
-            command: None,
-            args: Vec::new(),
-            resume: PanelResume::Last,
-            ssh_connection: None,
-        },
-        PresetConfig {
-            name: "OpenCode (Fresh)".to_string(),
-            alias: Some("ocf".to_string()),
-            kind: PanelKind::OpenCode,
-            command: None,
-            args: Vec::new(),
-            resume: PanelResume::Fresh,
-            ssh_connection: None,
-        },
-    ]
+pub(crate) fn default_opencode_presets() -> [PresetConfig; 1] {
+    [default_opencode_preset()]
+}
+
+pub(crate) fn default_opencode_preset() -> PresetConfig {
+    PresetConfig {
+        name: "OpenCode".to_string(),
+        alias: Some("oc".to_string()),
+        kind: PanelKind::OpenCode,
+        command: None,
+        args: Vec::new(),
+        resume: PanelResume::Fresh,
+        ssh_connection: None,
+    }
 }
 
 pub(crate) fn default_gemini_presets() -> [PresetConfig; 1] {
@@ -141,27 +160,20 @@ pub(crate) fn default_gemini_presets() -> [PresetConfig; 1] {
     }]
 }
 
-pub(crate) fn default_kilo_presets() -> [PresetConfig; 2] {
-    [
-        PresetConfig {
-            name: "KiloCode".to_string(),
-            alias: Some("kc".to_string()),
-            kind: PanelKind::KiloCode,
-            command: None,
-            args: Vec::new(),
-            resume: PanelResume::Last,
-            ssh_connection: None,
-        },
-        PresetConfig {
-            name: "KiloCode (Fresh)".to_string(),
-            alias: Some("kcf".to_string()),
-            kind: PanelKind::KiloCode,
-            command: None,
-            args: Vec::new(),
-            resume: PanelResume::Fresh,
-            ssh_connection: None,
-        },
-    ]
+pub(crate) fn default_kilo_presets() -> [PresetConfig; 1] {
+    [default_kilo_preset()]
+}
+
+pub(crate) fn default_kilo_preset() -> PresetConfig {
+    PresetConfig {
+        name: "KiloCode".to_string(),
+        alias: Some("kc".to_string()),
+        kind: PanelKind::KiloCode,
+        command: None,
+        args: Vec::new(),
+        resume: PanelResume::Fresh,
+        ssh_connection: None,
+    }
 }
 
 fn insert_missing_agent_presets(presets: &mut Vec<PresetConfig>, defaults: impl IntoIterator<Item = PresetConfig>) {
@@ -197,6 +209,38 @@ pub(crate) fn insert_missing_kilo_presets(presets: &mut Vec<PresetConfig>) {
     insert_missing_agent_presets(presets, default_kilo_presets());
 }
 
+/// Single Codex preset. Codex 0.128's default invocation is auto mode
+/// (`--sandbox workspace-write --ask-for-approval on-request`), so
+/// `--no-alt-screen` is the only flag we need to set. Menu launches always
+/// start a fresh session — same as every other coding-agent default.
+pub(crate) fn default_codex_preset() -> PresetConfig {
+    PresetConfig {
+        name: "Codex".to_string(),
+        alias: Some("cx".to_string()),
+        kind: PanelKind::Codex,
+        command: None,
+        args: vec!["--no-alt-screen".to_string()],
+        resume: PanelResume::Fresh,
+        ssh_connection: None,
+    }
+}
+
+/// Single Claude Code preset. `--permission-mode auto` (Claude Code v2.1.83+)
+/// routes actions through a separate classifier model; safer than the old
+/// `--dangerously-skip-permissions` and the right default for hands-off use.
+/// Menu launches always start a fresh session.
+pub(crate) fn default_claude_preset() -> PresetConfig {
+    PresetConfig {
+        name: "Claude Code".to_string(),
+        alias: Some("cc".to_string()),
+        kind: PanelKind::Claude,
+        command: None,
+        args: vec!["--permission-mode".to_string(), "auto".to_string()],
+        resume: PanelResume::Fresh,
+        ssh_connection: None,
+    }
+}
+
 fn default_presets() -> Vec<PresetConfig> {
     let mut presets = vec![
         PresetConfig {
@@ -208,42 +252,8 @@ fn default_presets() -> Vec<PresetConfig> {
             resume: PanelResume::Fresh,
             ssh_connection: None,
         },
-        PresetConfig {
-            name: "Codex".to_string(),
-            alias: Some("cx".to_string()),
-            kind: PanelKind::Codex,
-            command: None,
-            args: vec!["--no-alt-screen".to_string()],
-            resume: PanelResume::Last,
-            ssh_connection: None,
-        },
-        PresetConfig {
-            name: "Codex (YOLO)".to_string(),
-            alias: Some("cxy".to_string()),
-            kind: PanelKind::Codex,
-            command: None,
-            args: vec!["--yolo".to_string(), "--no-alt-screen".to_string()],
-            resume: PanelResume::Fresh,
-            ssh_connection: None,
-        },
-        PresetConfig {
-            name: "Claude Code".to_string(),
-            alias: Some("cc".to_string()),
-            kind: PanelKind::Claude,
-            command: None,
-            args: Vec::new(),
-            resume: PanelResume::Last,
-            ssh_connection: None,
-        },
-        PresetConfig {
-            name: "Claude Code (Auto)".to_string(),
-            alias: Some("cca".to_string()),
-            kind: PanelKind::Claude,
-            command: None,
-            args: vec!["--dangerously-skip-permissions".to_string()],
-            resume: PanelResume::Fresh,
-            ssh_connection: None,
-        },
+        default_codex_preset(),
+        default_claude_preset(),
     ];
     presets.extend(default_opencode_presets());
     presets.extend(default_gemini_presets());
@@ -289,6 +299,7 @@ pub struct ShortcutsConfig {
     pub focus_active_workspace: String,
     pub fit_active_workspace: String,
     pub open_remote_hosts: String,
+    pub toggle_sessions: String,
     pub toggle_sidebar: String,
     pub toggle_hud: String,
     pub toggle_minimap: String,
@@ -313,6 +324,7 @@ impl Default for ShortcutsConfig {
             focus_active_workspace: "Ctrl+Shift+W".to_string(),
             fit_active_workspace: "Ctrl+Shift+9".to_string(),
             open_remote_hosts: "Ctrl+Shift+H".to_string(),
+            toggle_sessions: "Ctrl+Shift+J".to_string(),
             toggle_sidebar: "Ctrl+Shift+B".to_string(),
             toggle_hud: "Ctrl+Shift+U".to_string(),
             toggle_minimap: "Ctrl+Shift+M".to_string(),
@@ -343,6 +355,7 @@ impl ShortcutsConfig {
             focus_active_workspace: parse_shortcut("focus_active_workspace", &self.focus_active_workspace)?,
             fit_active_workspace: parse_shortcut("fit_active_workspace", &self.fit_active_workspace)?,
             open_remote_hosts: parse_shortcut("open_remote_hosts", &self.open_remote_hosts)?,
+            toggle_sessions: parse_shortcut("toggle_sessions", &self.toggle_sessions)?,
             toggle_sidebar: parse_shortcut("toggle_sidebar", &self.toggle_sidebar)?,
             toggle_hud: parse_shortcut("toggle_hud", &self.toggle_hud)?,
             toggle_minimap: parse_shortcut("toggle_minimap", &self.toggle_minimap)?,
@@ -367,6 +380,7 @@ impl ShortcutsConfig {
             ("focus_active_workspace", shortcuts.focus_active_workspace),
             ("fit_active_workspace", shortcuts.fit_active_workspace),
             ("open_remote_hosts", shortcuts.open_remote_hosts),
+            ("toggle_sessions", shortcuts.toggle_sessions),
             ("toggle_sidebar", shortcuts.toggle_sidebar),
             ("toggle_hud", shortcuts.toggle_hud),
             ("toggle_minimap", shortcuts.toggle_minimap),
@@ -750,6 +764,28 @@ mod tests {
     }
 
     #[test]
+    fn appearance_defaults_to_auto_theme() {
+        let config: Config = serde_yaml::from_str("{}\n").expect("config should deserialize");
+
+        assert_eq!(config.appearance.theme, super::AppearanceTheme::Auto);
+        assert_eq!(Config::default().appearance.theme, super::AppearanceTheme::Auto);
+    }
+
+    #[test]
+    fn explicit_auto_theme_is_preserved() {
+        let config: Config = serde_yaml::from_str("appearance:\n  theme: auto\n").expect("config should deserialize");
+
+        assert_eq!(config.appearance.theme, super::AppearanceTheme::Auto);
+    }
+
+    #[test]
+    fn explicit_light_theme_is_preserved() {
+        let config: Config = serde_yaml::from_str("appearance:\n  theme: light\n").expect("config should deserialize");
+
+        assert_eq!(config.appearance.theme, super::AppearanceTheme::Light);
+    }
+
+    #[test]
     fn explicit_attention_feed_false_is_preserved() {
         let config: Config =
             serde_yaml::from_str("features:\n  attention_feed: false\n").expect("config should deserialize");
@@ -793,8 +829,10 @@ mod tests {
 
     #[test]
     fn workspace_navigation_shortcuts_resolve() {
-        let config = Config::from_yaml("shortcuts:\n  focus_active_workspace: Alt+W\n  fit_active_workspace: Alt+9\n")
-            .expect("config should deserialize");
+        let config = Config::from_yaml(
+            "shortcuts:\n  focus_active_workspace: Alt+W\n  fit_active_workspace: Alt+9\n  toggle_sessions: Alt+J\n",
+        )
+        .expect("config should deserialize");
 
         let shortcuts = config.shortcuts.resolve().expect("shortcuts should resolve");
 
@@ -805,6 +843,10 @@ mod tests {
         assert_eq!(
             shortcuts.fit_active_workspace,
             crate::shortcuts::ShortcutBinding::parse("Alt+9").expect("shortcut should parse")
+        );
+        assert_eq!(
+            shortcuts.toggle_sessions,
+            crate::shortcuts::ShortcutBinding::parse("Alt+J").expect("shortcut should parse")
         );
     }
 

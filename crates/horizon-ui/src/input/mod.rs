@@ -266,6 +266,50 @@ mod tests {
         assert_eq!(translation.bytes, b"\x1b[13;2u");
     }
 
+    #[test]
+    fn printable_space_stays_on_text_path_without_report_all_keys() {
+        let key_translation = translate_key_event(
+            Key::Space,
+            true,
+            false,
+            Modifiers::NONE,
+            TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS,
+        );
+        assert!(
+            key_translation.is_none(),
+            "space key press should defer to the text event"
+        );
+
+        let text_translation = translate_text_event(
+            super::KeyIdentity::new(Key::Space, Some(Key::Space), Some(" ")),
+            " ",
+            super::KeyEventContext::new(
+                true,
+                false,
+                Modifiers::NONE,
+                TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS,
+            ),
+        );
+        assert!(
+            text_translation.is_none(),
+            "space text should stay on the raw text path"
+        );
+    }
+
+    #[test]
+    fn printable_space_uses_kitty_sequence_when_report_all_keys_is_enabled() {
+        let translation = translate_key_event(
+            Key::Space,
+            true,
+            false,
+            Modifiers::NONE,
+            TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS | TermMode::REPORT_ALL_KEYS_AS_ESC,
+        )
+        .expect("space with report-all");
+
+        assert_eq!(translation.bytes, b"\x1b[32u");
+    }
+
     /// Regression: `AltGr` is reported by winit as Alt. When typing @
     /// via `AltGr+2`, `translate_key_event` must NOT produce an alt-prefixed
     /// sequence for Num2, because the actual character (@) arrives as a
@@ -284,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn kitty_text_translation_uses_physical_digit_for_shifted_symbol() {
+    fn printable_shifted_symbol_stays_on_text_path_without_report_all_keys() {
         let translation = translate_text_event(
             super::KeyIdentity::new(Key::Num2, Some(Key::Num2), Some("2")),
             "@",
@@ -294,14 +338,13 @@ mod tests {
                 Modifiers::SHIFT,
                 TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS,
             ),
-        )
-        .expect("shifted symbol");
+        );
 
-        assert_eq!(translation.bytes, b"\x1b[50:64;2u");
+        assert!(translation.is_none(), "shifted symbols should stay on the text path");
     }
 
     #[test]
-    fn kitty_text_translation_reports_associated_text_for_altgr_symbol() {
+    fn printable_altgr_symbol_stays_on_text_path_without_report_all_keys() {
         let translation = translate_text_event(
             super::KeyIdentity::new(Key::Num2, Some(Key::Num2), Some("2")),
             "@",
@@ -311,14 +354,13 @@ mod tests {
                 Modifiers::ALT,
                 TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS | TermMode::REPORT_ASSOCIATED_TEXT,
             ),
-        )
-        .expect("altgr symbol");
+        );
 
-        assert_eq!(translation.bytes, b"\x1b[50:64;3;64u");
+        assert!(translation.is_none(), "AltGr text should stay on the text path");
     }
 
     #[test]
-    fn kitty_text_translation_uses_unshifted_international_primary_key() {
+    fn printable_international_text_stays_on_text_path_without_report_all_keys() {
         let translation = translate_text_event(
             super::KeyIdentity::new(Key::OpenBracket, Some(Key::OpenBracket), Some("å")),
             "å",
@@ -328,14 +370,16 @@ mod tests {
                 Modifiers::NONE,
                 TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS,
             ),
-        )
-        .expect("international text");
+        );
 
-        assert_eq!(translation.bytes, b"\x1b[229::91u");
+        assert!(
+            translation.is_none(),
+            "plain international text should stay on the text path"
+        );
     }
 
     #[test]
-    fn kitty_text_translation_keeps_shifted_international_key_unshifted_in_primary_slot() {
+    fn printable_text_uses_kitty_sequences_when_report_all_keys_is_enabled() {
         let translation = translate_text_event(
             super::KeyIdentity::new(Key::OpenBracket, Some(Key::OpenBracket), Some("å")),
             "Å",
@@ -343,7 +387,7 @@ mod tests {
                 true,
                 false,
                 Modifiers::SHIFT,
-                TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS,
+                TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS | TermMode::REPORT_ALL_KEYS_AS_ESC,
             ),
         )
         .expect("shifted international text");
@@ -352,58 +396,23 @@ mod tests {
     }
 
     #[test]
-    fn kitty_text_translation_covers_norwegian_swedish_and_us_layouts() {
-        type LayoutCase<'a> = (&'a str, Key, &'a str, &'a str, Modifiers, &'a [u8]);
+    fn printable_layout_cases_stay_on_text_path_without_report_all_keys() {
+        type LayoutCase<'a> = (&'a str, Key, &'a str, &'a str, Modifiers);
 
         let cases: [LayoutCase<'_>; 10] = [
-            ("norwegian æ", Key::Quote, "æ", "æ", Modifiers::NONE, b"\x1b[230::39u"),
-            (
-                "norwegian Æ",
-                Key::Quote,
-                "æ",
-                "Æ",
-                Modifiers::SHIFT,
-                b"\x1b[230:198:39;2u",
-            ),
-            (
-                "norwegian ø",
-                Key::Semicolon,
-                "ø",
-                "ø",
-                Modifiers::NONE,
-                b"\x1b[248::59u",
-            ),
-            (
-                "norwegian Ø",
-                Key::Semicolon,
-                "ø",
-                "Ø",
-                Modifiers::SHIFT,
-                b"\x1b[248:216:59;2u",
-            ),
-            ("swedish ä", Key::Quote, "ä", "ä", Modifiers::NONE, b"\x1b[228::39u"),
-            (
-                "swedish Ä",
-                Key::Quote,
-                "ä",
-                "Ä",
-                Modifiers::SHIFT,
-                b"\x1b[228:196:39;2u",
-            ),
-            ("swedish ö", Key::Semicolon, "ö", "ö", Modifiers::NONE, b"\x1b[246::59u"),
-            (
-                "swedish Ö",
-                Key::Semicolon,
-                "ö",
-                "Ö",
-                Modifiers::SHIFT,
-                b"\x1b[246:214:59;2u",
-            ),
-            ("us semicolon", Key::Semicolon, ";", ";", Modifiers::NONE, b"\x1b[59u"),
-            ("us colon", Key::Semicolon, ";", ":", Modifiers::SHIFT, b"\x1b[59:58;2u"),
+            ("norwegian æ", Key::Quote, "æ", "æ", Modifiers::NONE),
+            ("norwegian Æ", Key::Quote, "æ", "Æ", Modifiers::SHIFT),
+            ("norwegian ø", Key::Semicolon, "ø", "ø", Modifiers::NONE),
+            ("norwegian Ø", Key::Semicolon, "ø", "Ø", Modifiers::SHIFT),
+            ("swedish ä", Key::Quote, "ä", "ä", Modifiers::NONE),
+            ("swedish Ä", Key::Quote, "ä", "Ä", Modifiers::SHIFT),
+            ("swedish ö", Key::Semicolon, "ö", "ö", Modifiers::NONE),
+            ("swedish Ö", Key::Semicolon, "ö", "Ö", Modifiers::SHIFT),
+            ("us semicolon", Key::Semicolon, ";", ";", Modifiers::NONE),
+            ("us colon", Key::Semicolon, ";", ":", Modifiers::SHIFT),
         ];
 
-        for (name, key, unshifted, text, modifiers, expected) in cases {
+        for (name, key, unshifted, text, modifiers) in cases {
             let translation = translate_text_event(
                 super::KeyIdentity::new(key, Some(key), Some(unshifted)),
                 text,
@@ -413,10 +422,9 @@ mod tests {
                     modifiers,
                     TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS,
                 ),
-            )
-            .unwrap_or_else(|| panic!("{name}"));
+            );
 
-            assert_eq!(translation.bytes, expected, "{name}");
+            assert!(translation.is_none(), "{name}");
         }
     }
 }

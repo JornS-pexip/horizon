@@ -45,7 +45,7 @@ impl HorizonApp {
             } => {
                 super::update_workspace_cwd(self.board.workspace_mut(workspace_id), path);
                 let mut options = preset.to_panel_options();
-                options.position = canvas_pos;
+                options.position = super::add_panel_position(&self.board, workspace_id, canvas_pos);
                 if let Err(error) = self.create_panel_with_options(options, workspace_id) {
                     tracing::error!("failed to create panel: {error}");
                 }
@@ -123,8 +123,8 @@ impl HorizonApp {
             .order(Order::Tooltip)
             .show(ctx, |ui| {
                 egui::Frame::default()
-                    .fill(theme::PANEL_BG)
-                    .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+                    .fill(theme::PANEL_BG())
+                    .stroke(Stroke::new(1.0, theme::BORDER_STRONG()))
                     .corner_radius(8)
                     .inner_margin(Margin::symmetric(8, 6))
                     .show(ui, |ui| {
@@ -132,7 +132,7 @@ impl HorizonApp {
                         ui.label(
                             egui::RichText::new(preset_picker_heading(target_workspace))
                                 .size(11.0)
-                                .color(theme::FG_DIM)
+                                .color(theme::FG_DIM())
                                 .strong(),
                         );
                         ui.add_space(4.0);

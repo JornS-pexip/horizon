@@ -3,13 +3,20 @@ use std::collections::VecDeque;
 use alacritty_terminal::term::TermMode;
 use egui::emath::TSTransform;
 use egui::{Key, PointerButton, Pos2, Rect, Vec2};
-use horizon_core::{Panel, SelectionType, TerminalSide};
+use horizon_core::{
+    Panel, PanelKind, SelectionType, ShortcutBinding, ShortcutKey, ShortcutModifiers, SshConnectionStatus, TerminalSide,
+};
 
 use super::super::input::{self, TerminalInputEvent};
 use super::super::primary_selection::PrimarySelection;
+use crate::app::shortcuts::shortcut_event_matches;
 
+use super::ime::{prepare_terminal_keyboard_events, store_terminal_ime_enabled, terminal_ime_enabled};
 use super::layout::{GridMetrics, TerminalInteraction, cell_side, grid_point_from_position};
 use super::scrollbar::{scrollbar_pointer_to_scrollback, scrollbar_thumb_height};
+
+pub(crate) const SSH_RECONNECT_SHORTCUT: ShortcutBinding =
+    ShortcutBinding::new(ShortcutModifiers::PRIMARY_SHIFT, ShortcutKey::Letter('R'));
 
 #[derive(Clone, Copy)]
 pub(super) struct PointerSupport<'a> {
@@ -29,6 +36,7 @@ struct PointerContext<'a> {
     current_modifiers: egui::Modifiers,
     hovered_point: Option<input::GridPoint>,
     from_global: Option<TSTransform>,
+    active_pointer_pos: Option<Pos2>,
     primary_selection: &'a PrimarySelection,
     ui_ctx: egui::Context,
 }
@@ -47,10 +55,32 @@ pub(super) fn handle_terminal_pointer_input(
         interaction.body.request_focus();
     }
 
-    let events: Vec<egui::Event> = ui.input(|input| input.events.clone());
     let from_global = ui.ctx().layer_transform_from_global(ui.layer_id());
     let body_pointer_pos = response_pointer_pos(&interaction.body);
     let scrollbar_pointer_pos = response_pointer_pos(&interaction.scrollbar);
+
+    // Check cheap interaction-state conditions before cloning the event list.
+    // For most panels the pointer is elsewhere, so we exit early and avoid the
+    // per-panel Vec<Event> clone entirely.
+    let should_handle_pointer = body_pointer_pos.is_some()
+        || scrollbar_pointer_pos.is_some()
+        || interaction.body.is_pointer_button_down_on()
+        || interaction.scrollbar.is_pointer_button_down_on()
+        || interaction.body.drag_stopped_by(PointerButton::Primary)
+        || interaction.body.double_clicked()
+        || interaction.body.triple_clicked()
+        || interaction.body.clicked_by(PointerButton::Middle)
+        || interaction.scrollbar.clicked()
+        || ui.input(|input| {
+            pointer_event_targets_rect(&input.events, from_global, interaction.layout.body)
+                || pointer_event_targets_rect(&input.events, from_global, interaction.layout.scrollbar)
+        });
+    if !should_handle_pointer {
+        return;
+    }
+
+    // Only clone events for the panel that actually needs pointer processing.
+    let events: Vec<egui::Event> = ui.input(|input| input.events.clone());
     let body_primary_press_pos = pointer_button_event_pos(
         &events,
         from_global,
@@ -65,20 +95,6 @@ pub(super) fn handle_terminal_pointer_input(
         true,
         interaction.layout.body,
     );
-    let should_handle_pointer = body_pointer_pos.is_some()
-        || scrollbar_pointer_pos.is_some()
-        || pointer_event_targets_rect(&events, from_global, interaction.layout.body)
-        || pointer_event_targets_rect(&events, from_global, interaction.layout.scrollbar)
-        || interaction.body.is_pointer_button_down_on()
-        || interaction.scrollbar.is_pointer_button_down_on()
-        || interaction.body.drag_stopped_by(PointerButton::Primary)
-        || interaction.body.double_clicked()
-        || interaction.body.triple_clicked()
-        || interaction.body.clicked_by(PointerButton::Middle)
-        || interaction.scrollbar.clicked();
-    if !should_handle_pointer {
-        return;
-    }
 
     let Some(terminal_mode) = panel.terminal_mut().map(|terminal| terminal.mode()) else {
         return;
@@ -89,6 +105,9 @@ pub(super) fn handle_terminal_pointer_input(
         secondary: input.pointer.secondary_down(),
     });
     let current_modifiers = ui.input(|input| input.modifiers);
+    let active_pointer_pos = ui
+        .input(|input| input.pointer.interact_pos())
+        .map(|position| transform_pos(from_global, position));
     let hovered_point = interaction
         .body
         .hover_pos()
@@ -112,6 +131,7 @@ pub(super) fn handle_terminal_pointer_input(
         current_modifiers,
         hovered_point,
         from_global,
+        active_pointer_pos,
         primary_selection: support.primary_selection,
         ui_ctx: ui.ctx().clone(),
     };
@@ -214,7 +234,9 @@ fn handle_terminal_body_pointer_actions(
     body_primary_press_pos: Option<Pos2>,
     body_middle_press_pos: Option<Pos2>,
 ) {
-    let body_pointer_pos = response_pointer_pos(&pointer.interaction.body);
+    let body_pointer_pos = pointer
+        .active_pointer_pos
+        .or_else(|| response_pointer_pos(&pointer.interaction.body));
 
     if (pointer.current_modifiers.ctrl || pointer.current_modifiers.command)
         && let Some(pos) = body_primary_press_pos
@@ -321,8 +343,9 @@ fn handle_pointer_button(
         } else {
             SelectionType::Simple
         };
+        let side = cell_side(pos, pointer.interaction.layout.body, pointer.metrics, point);
         if let Some(terminal) = panel.terminal_mut() {
-            terminal.start_selection(sel_type, point.line, point.column);
+            terminal.start_selection(sel_type, point.line, point.column, side);
         }
     }
 }
@@ -451,19 +474,36 @@ fn handle_pointer_selection_drag(
 
 pub(super) fn handle_terminal_keyboard_input(
     ui: &egui::Ui,
+    terminal_id: egui::Id,
     panel: &mut Panel,
     events: &[TerminalInputEvent],
     primary_selection: &PrimarySelection,
-) {
+    local_ssh_reconnect_enabled: bool,
+) -> bool {
+    if local_ssh_reconnect_enabled && disconnected_ssh_reconnect_requested(panel.kind, panel.ssh_status(), events) {
+        return true;
+    }
+
     let Some(terminal) = panel.terminal_mut() else {
-        return;
+        return false;
     };
     let mode = terminal.mode();
     let mut forwarder = KeyboardInputForwarder::default();
+    let mut ime_enabled = terminal_ime_enabled(ui, terminal_id);
+    let events = prepare_terminal_keyboard_events(events, ime_enabled);
 
-    for event in events {
+    for event in &events {
         match &event.event {
+            egui::Event::Ime(egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_)) => {
+                ime_enabled = true;
+            }
+            egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                ime_enabled = false;
+            }
             egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                if matches!(&event.event, egui::Event::Ime(egui::ImeEvent::Commit(_))) {
+                    ime_enabled = false;
+                }
                 let emission = forwarder.on_text(text, mode);
                 if emission.clears_selection {
                     terminal.clear_selection();
@@ -478,12 +518,12 @@ pub(super) fn handle_terminal_keyboard_input(
                 terminal.write_input(&bytes);
             }
             egui::Event::Copy => {
-                if let Some(text) = terminal.selection_to_string() {
+                if event.is_plain_ctrl_c_copy_command() {
+                    terminal.write_input(&[3]);
+                } else if let Some(text) = terminal.selection_to_string() {
                     primary_selection.copy(&text);
                     ui.ctx().copy_text(text);
                     terminal.clear_selection();
-                } else {
-                    terminal.write_input(&[3]);
                 }
             }
             egui::Event::Cut => {
@@ -508,6 +548,29 @@ pub(super) fn handle_terminal_keyboard_input(
     if !emission.bytes.is_empty() {
         terminal.write_input(&emission.bytes);
     }
+
+    store_terminal_ime_enabled(ui, terminal_id, ime_enabled);
+
+    false
+}
+
+fn disconnected_ssh_reconnect_requested(
+    kind: PanelKind,
+    ssh_status: Option<SshConnectionStatus>,
+    events: &[TerminalInputEvent],
+) -> bool {
+    kind == PanelKind::Ssh
+        && matches!(ssh_status, Some(SshConnectionStatus::Disconnected))
+        && events.iter().any(|input_event| {
+            matches!(
+                &input_event.event,
+                egui::Event::Key {
+                    pressed: true,
+                    repeat: false,
+                    ..
+                }
+            ) && shortcut_event_matches(&input_event.event, SSH_RECONNECT_SHORTCUT)
+        })
 }
 
 #[derive(Default)]
@@ -747,11 +810,12 @@ impl InputEmission {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyboardInputForwarder, TerminalInputEvent, pointer_button_event_pos, pointer_event_targets_rect,
-        selection_copy_completed, should_request_primary_paste,
+        KeyboardInputForwarder, TerminalInputEvent, disconnected_ssh_reconnect_requested, pointer_button_event_pos,
+        pointer_event_targets_rect, selection_copy_completed, should_request_primary_paste,
     };
     use alacritty_terminal::term::TermMode;
     use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect};
+    use horizon_core::{PanelKind, SshConnectionStatus};
 
     #[test]
     fn middle_click_requests_primary_paste_only_on_linux_without_ctrl_or_cmd() {
@@ -808,7 +872,71 @@ mod tests {
     }
 
     #[test]
-    fn altgr_text_after_release_emits_only_kitty_sequences() {
+    fn disconnected_ssh_panels_request_reconnect_from_local_shortcut() {
+        assert!(disconnected_ssh_reconnect_requested(
+            PanelKind::Ssh,
+            Some(SshConnectionStatus::Disconnected),
+            &[key_event(
+                Key::R,
+                Some(Key::R),
+                None,
+                true,
+                false,
+                Modifiers::COMMAND | Modifiers::SHIFT,
+            )],
+        ));
+    }
+
+    #[test]
+    fn connected_ssh_panels_ignore_local_reconnect_shortcut() {
+        assert!(!disconnected_ssh_reconnect_requested(
+            PanelKind::Ssh,
+            Some(SshConnectionStatus::Connected),
+            &[key_event(
+                Key::R,
+                Some(Key::R),
+                None,
+                true,
+                false,
+                Modifiers::COMMAND | Modifiers::SHIFT,
+            )],
+        ));
+    }
+
+    #[test]
+    fn non_ssh_panels_ignore_local_reconnect_shortcut() {
+        assert!(!disconnected_ssh_reconnect_requested(
+            PanelKind::Shell,
+            None,
+            &[key_event(
+                Key::R,
+                Some(Key::R),
+                None,
+                true,
+                false,
+                Modifiers::COMMAND | Modifiers::SHIFT,
+            )],
+        ));
+    }
+
+    #[test]
+    fn repeated_reconnect_shortcut_does_not_queue_another_restart() {
+        assert!(!disconnected_ssh_reconnect_requested(
+            PanelKind::Ssh,
+            Some(SshConnectionStatus::Disconnected),
+            &[key_event(
+                Key::R,
+                Some(Key::R),
+                None,
+                true,
+                true,
+                Modifiers::COMMAND | Modifiers::SHIFT,
+            )],
+        ));
+    }
+
+    #[test]
+    fn altgr_text_after_release_stays_on_text_path_without_report_all_keys() {
         let events = vec![
             key_event(Key::Num2, Some(Key::Num2), Some("2"), true, false, Modifiers::ALT),
             key_event(Key::Num2, Some(Key::Num2), Some("2"), false, false, Modifiers::ALT),
@@ -820,11 +948,11 @@ mod tests {
             TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES | TermMode::REPORT_ALTERNATE_KEYS,
         );
 
-        assert_eq!(bytes, b"\x1b[50:64;3u\x1b[50:64;3:3u");
+        assert_eq!(bytes, b"@");
     }
 
     #[test]
-    fn shifted_symbol_uses_text_reconciliation_for_release_order() {
+    fn shifted_symbol_uses_text_reconciliation_without_forcing_kitty_sequences() {
         let events = vec![
             key_event(Key::Num2, Some(Key::Num2), Some("2"), true, false, Modifiers::SHIFT),
             text_event("@"),
@@ -836,15 +964,64 @@ mod tests {
             TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES | TermMode::REPORT_ALTERNATE_KEYS,
         );
 
-        assert_eq!(bytes, b"\x1b[50:64;2u\x1b[50:64;2:3u");
+        assert_eq!(bytes, b"@");
+    }
+
+    #[test]
+    fn plain_space_stays_on_text_path_in_kitty_basic_mode() {
+        let events = vec![
+            key_event(Key::Space, Some(Key::Space), Some(" "), true, false, Modifiers::NONE),
+            text_event(" "),
+            key_event(Key::Space, Some(Key::Space), Some(" "), false, false, Modifiers::NONE),
+        ];
+
+        let bytes = forward_bytes(
+            &events,
+            TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES | TermMode::REPORT_ALTERNATE_KEYS,
+        );
+
+        assert_eq!(bytes, b" ");
+    }
+
+    #[test]
+    fn repeated_spaces_do_not_get_dropped_in_kitty_basic_mode() {
+        let events = vec![
+            key_event(Key::Space, Some(Key::Space), Some(" "), true, false, Modifiers::NONE),
+            text_event(" "),
+            key_event(Key::Space, Some(Key::Space), Some(" "), false, false, Modifiers::NONE),
+            key_event(Key::Space, Some(Key::Space), Some(" "), true, false, Modifiers::NONE),
+            text_event(" "),
+            key_event(Key::Space, Some(Key::Space), Some(" "), false, false, Modifiers::NONE),
+        ];
+
+        let bytes = forward_bytes(
+            &events,
+            TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES | TermMode::REPORT_ALTERNATE_KEYS,
+        );
+
+        assert_eq!(bytes, b"  ");
+    }
+
+    #[test]
+    fn shifted_space_stays_on_text_path_in_kitty_basic_mode() {
+        let events = vec![
+            key_event(Key::Space, Some(Key::Space), Some(" "), true, false, Modifiers::SHIFT),
+            text_event(" "),
+            key_event(Key::Space, Some(Key::Space), Some(" "), false, false, Modifiers::SHIFT),
+        ];
+
+        let bytes = forward_bytes(
+            &events,
+            TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES | TermMode::REPORT_ALTERNATE_KEYS,
+        );
+
+        assert_eq!(bytes, b" ");
     }
 
     /// Regression: on some Linux setups, `AltGr` is NOT reported as
-    /// `modifiers.alt` by winit.  When kitty keyboard protocol is active,
-    /// the key press was immediately emitted as a kitty sequence for the
-    /// base key ("2") and the text event ("@") passed through as raw
-    /// text because suppression expected "2".  Result: "2@" instead of
-    /// just the kitty sequence for "@".
+    /// `modifiers.alt` by winit. The key event must not leak the base
+    /// key ("2") ahead of the later text event ("@"), even when kitty
+    /// keyboard mode is active.
     #[test]
     fn altgr_without_alt_modifier_in_kitty_mode_does_not_leak_base_key() {
         let events = vec![
@@ -858,11 +1035,7 @@ mod tests {
             TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES | TermMode::REPORT_ALTERNATE_KEYS,
         );
 
-        // Must produce kitty sequences for "@" (codepoint 64), NOT
-        // the base key "2" (codepoint 50) followed by raw "@".
-        // Release includes ";1" (no-modifier marker) because
-        // REPORT_EVENT_TYPES forces the modifier field.
-        assert_eq!(bytes, b"\x1b[50:64u\x1b[50:64;1:3u");
+        assert_eq!(bytes, b"@");
     }
 
     /// Same scenario as above but in non-kitty mode: the text event
@@ -881,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn shifted_international_key_uses_observed_unshifted_text_for_primary_code() {
+    fn shifted_international_key_stays_on_text_path_without_report_all_keys() {
         let events = vec![
             key_event(
                 Key::OpenBracket,
@@ -905,6 +1078,39 @@ mod tests {
         let bytes = forward_bytes(
             &events,
             TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES | TermMode::REPORT_ALTERNATE_KEYS,
+        );
+
+        assert_eq!(bytes, "Å".as_bytes());
+    }
+
+    #[test]
+    fn report_all_keys_keeps_printable_text_on_kitty_sequence_path() {
+        let events = vec![
+            key_event(
+                Key::OpenBracket,
+                Some(Key::OpenBracket),
+                Some("å"),
+                true,
+                false,
+                Modifiers::SHIFT,
+            ),
+            text_event("Å"),
+            key_event(
+                Key::OpenBracket,
+                Some(Key::OpenBracket),
+                Some("å"),
+                false,
+                false,
+                Modifiers::SHIFT,
+            ),
+        ];
+
+        let bytes = forward_bytes(
+            &events,
+            TermMode::DISAMBIGUATE_ESC_CODES
+                | TermMode::REPORT_EVENT_TYPES
+                | TermMode::REPORT_ALTERNATE_KEYS
+                | TermMode::REPORT_ALL_KEYS_AS_ESC,
         );
 
         assert_eq!(bytes, b"\x1b[229:197:91;2u\x1b[229:197:91;2:3u");
@@ -999,6 +1205,7 @@ mod tests {
                 modifiers,
             },
             key_without_modifiers_text: key_without_modifiers_text.map(ToOwned::to_owned),
+            observed_key: None,
         }
     }
 
@@ -1006,6 +1213,7 @@ mod tests {
         TerminalInputEvent {
             event: Event::Text(text.to_owned()),
             key_without_modifiers_text: None,
+            observed_key: None,
         }
     }
 }

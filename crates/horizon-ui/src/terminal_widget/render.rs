@@ -107,7 +107,7 @@ fn build_grid_shapes(ui: &egui::Ui, rect: Rect, content: RenderableContent<'_>, 
             let cell_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(width, metrics.line_height));
             let selected = content
                 .selection
-                .is_some_and(|selection| selection.contains_cell(&indexed, indexed.point, content.cursor.shape));
+                .is_some_and(|selection| selection.contains_cell(&indexed, content.cursor.point, content.cursor.shape));
             let (fg, bg) = cell_colors(indexed.cell, selected, content.colors);
             let batchable_char = batchable_cell_char(indexed.cell).filter(|_| !has_cell_decoration(indexed.cell));
 
@@ -199,7 +199,7 @@ pub(super) fn render_cursor(
     let y = rect.min.y + usize_to_f32(point.line) * metrics.line_height;
     let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(metrics.char_width, metrics.line_height));
     let painter = ui.painter_at(rect);
-    let stroke = egui::Stroke::new(1.2, theme::CURSOR.gamma_multiply(0.82));
+    let stroke = egui::Stroke::new(1.2, theme::CURSOR().gamma_multiply(0.82));
 
     if !has_focus {
         painter.rect_stroke(cursor_rect, CornerRadius::same(1), stroke, StrokeKind::Outside);
@@ -208,18 +208,18 @@ pub(super) fn render_cursor(
 
     match cursor.shape {
         CursorShape::Block => {
-            painter.rect_filled(cursor_rect, CornerRadius::same(1), theme::CURSOR.gamma_multiply(0.8));
+            painter.rect_filled(cursor_rect, CornerRadius::same(1), theme::CURSOR().gamma_multiply(0.8));
         }
         CursorShape::Underline => {
             let underline = Rect::from_min_size(
                 Pos2::new(cursor_rect.min.x, cursor_rect.max.y - 2.0),
                 Vec2::new(cursor_rect.width(), 2.0),
             );
-            painter.rect_filled(underline, CornerRadius::same(1), theme::CURSOR.gamma_multiply(0.9));
+            painter.rect_filled(underline, CornerRadius::same(1), theme::CURSOR().gamma_multiply(0.9));
         }
         CursorShape::Beam => {
             let beam = Rect::from_min_size(cursor_rect.min, Vec2::new(2.0, cursor_rect.height()));
-            painter.rect_filled(beam, CornerRadius::same(1), theme::CURSOR.gamma_multiply(0.9));
+            painter.rect_filled(beam, CornerRadius::same(1), theme::CURSOR().gamma_multiply(0.9));
         }
         CursorShape::HollowBlock => {
             painter.rect_stroke(cursor_rect, CornerRadius::same(1), stroke, StrokeKind::Outside);
@@ -242,7 +242,7 @@ fn cell_colors(
         )
         && matches!(cell.bg, TerminalColor::Named(NamedColor::Background))
     {
-        return (theme::FG, theme::PANEL_BG);
+        return (theme::FG(), theme::PANEL_BG());
     }
 
     let mut fg = theme::terminal_color_to_egui(cell.fg, colors);
@@ -262,8 +262,19 @@ fn cell_colors(
 
     if selected {
         std::mem::swap(&mut fg, &mut bg);
-        bg = theme::alpha(theme::ACCENT, 76);
-        fg = theme::FG;
+        bg = theme::alpha(theme::ACCENT(), 76);
+        fg = theme::FG();
+    }
+
+    if bg.a() < u8::MAX {
+        bg = theme::composite_over(theme::PANEL_BG(), bg);
+    }
+    if fg.a() < u8::MAX {
+        fg = theme::composite_over(bg, fg);
+    }
+
+    if !cell.flags.contains(Flags::HIDDEN) {
+        fg = theme::ensure_terminal_text_contrast(fg, bg);
     }
 
     (fg, bg)
@@ -277,19 +288,22 @@ fn cell_text(cell: &Cell) -> Option<String> {
         return None;
     }
 
-    if cell.c == ' ' && cell.zerowidth().is_none() {
+    let zerowidth = cell.zerowidth();
+    if cell.c == ' ' && zerowidth.is_none() {
         return None;
     }
 
-    let mut text = String::new();
-    text.push(cell.c);
-    if let Some(chars) = cell.zerowidth() {
-        for ch in chars {
-            text.push(*ch);
+    match zerowidth {
+        Some(chars) => {
+            let mut text = String::with_capacity(cell.c.len_utf8() + chars.len() * 3);
+            text.push(cell.c);
+            for ch in chars {
+                text.push(*ch);
+            }
+            Some(text)
         }
+        None => Some(cell.c.to_string()),
     }
-
-    Some(text)
 }
 
 fn batchable_cell_char(cell: &Cell) -> Option<char> {
@@ -340,7 +354,7 @@ fn append_background_rect(
     bg: Color32,
     selected: bool,
 ) {
-    if bg == theme::PANEL_BG && !selected {
+    if bg == theme::PANEL_BG() && !selected {
         flush_background_run(shapes, run);
         return;
     }
@@ -423,7 +437,14 @@ fn append_cell_decoration(
 
 #[cfg(test)]
 mod tests {
-    use super::merge_shape_layers;
+    use super::{cell_colors, merge_shape_layers};
+    use crate::theme;
+    use alacritty_terminal::grid::Indexed;
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::selection::SelectionRange;
+    use alacritty_terminal::term::cell::Cell;
+    use alacritty_terminal::term::color::Colors;
+    use alacritty_terminal::vte::ansi::{Color as TerminalColor, CursorShape, NamedColor};
     use egui::{Color32, Pos2, Rect, Shape};
 
     #[test]
@@ -447,5 +468,39 @@ mod tests {
         );
 
         assert_eq!(merged, vec![background_a, background_b, foreground_a, foreground_b]);
+    }
+
+    #[test]
+    fn block_cursor_only_hides_selection_at_actual_cursor_position() {
+        let cell = Cell::default();
+        let indexed = Indexed {
+            point: Point::new(Line(0), Column(2)),
+            cell: &cell,
+        };
+        let selection = SelectionRange::new(indexed.point, Point::new(Line(0), Column(4)), false);
+
+        assert!(selection.contains_cell(&indexed, Point::new(Line(0), Column(7)), CursorShape::Block));
+        assert!(!selection.contains_cell(&indexed, indexed.point, CursorShape::Block));
+    }
+
+    #[test]
+    fn dim_foreground_is_flattened_before_contrast_in_light_theme() {
+        theme::set_theme(theme::ResolvedTheme::Light);
+
+        let cell = Cell {
+            fg: TerminalColor::Named(NamedColor::DimForeground),
+            bg: TerminalColor::Named(NamedColor::Background),
+            ..Cell::default()
+        };
+
+        let (fg, bg) = cell_colors(&cell, false, &Colors::default());
+        let expected = theme::ensure_terminal_text_contrast(
+            theme::composite_over(theme::PANEL_BG(), theme::alpha(theme::FG_SOFT(), 196)),
+            theme::PANEL_BG(),
+        );
+
+        assert_eq!(bg, theme::PANEL_BG());
+        assert_eq!(fg, expected);
+        assert_eq!(fg.a(), u8::MAX);
     }
 }

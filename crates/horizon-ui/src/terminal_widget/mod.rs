@@ -1,3 +1,4 @@
+mod ime;
 mod input;
 mod layout;
 mod render;
@@ -6,6 +7,8 @@ mod scrollbar;
 use egui::{Context, FontId, Vec2};
 use horizon_core::Panel;
 
+use self::ime::{clear_terminal_ime_state, publish_terminal_ime_output};
+pub(crate) use self::input::SSH_RECONNECT_SHORTCUT;
 use self::input::{PointerSupport, handle_terminal_keyboard_input, handle_terminal_pointer_input};
 use self::layout::{GridMetrics, terminal_interaction, terminal_layout, terminal_viewport_size};
 pub(crate) use self::render::TerminalGridCache;
@@ -21,6 +24,13 @@ pub struct TerminalView<'a> {
     grid_cache: Option<&'a mut TerminalGridCache>,
 }
 
+pub struct TerminalKeyboardContext<'a> {
+    pub keyboard_events: &'a [super::input::TerminalInputEvent],
+    pub primary_selection: &'a PrimarySelection,
+    pub local_ssh_reconnect_enabled: bool,
+    pub reconnect_requested: &'a mut bool,
+}
+
 impl<'a> TerminalView<'a> {
     pub fn new(panel: &'a mut Panel, grid_cache: Option<&'a mut TerminalGridCache>) -> Self {
         Self { panel, grid_cache }
@@ -33,8 +43,7 @@ impl<'a> TerminalView<'a> {
         ui: &mut egui::Ui,
         is_active_panel: bool,
         interactive: bool,
-        keyboard_events: &[super::input::TerminalInputEvent],
-        primary_selection: &PrimarySelection,
+        keyboard: TerminalKeyboardContext<'_>,
     ) -> bool {
         let metrics = grid_metrics(ui.ctx());
         let char_width = metrics.char_width;
@@ -58,7 +67,7 @@ impl<'a> TerminalView<'a> {
                     metrics: &metrics,
                     visible_rows: new_rows,
                     visible_cols: new_cols,
-                    primary_selection,
+                    primary_selection: keyboard.primary_selection,
                 },
             );
         }
@@ -82,6 +91,9 @@ impl<'a> TerminalView<'a> {
                     },
                 );
             });
+            publish_terminal_ime_output(ui, self.panel, &interaction, &metrics);
+        } else {
+            clear_terminal_ime_state(ui, interaction.body.id);
         }
 
         let allow_grid_cache = !self.panel.had_recent_output()
@@ -127,7 +139,14 @@ impl<'a> TerminalView<'a> {
         }
 
         if interactive && has_terminal_focus {
-            handle_terminal_keyboard_input(ui, self.panel, keyboard_events, primary_selection);
+            *keyboard.reconnect_requested |= handle_terminal_keyboard_input(
+                ui,
+                interaction.body.id,
+                self.panel,
+                keyboard.keyboard_events,
+                keyboard.primary_selection,
+                keyboard.local_ssh_reconnect_enabled,
+            );
         }
 
         interaction.body.clicked()

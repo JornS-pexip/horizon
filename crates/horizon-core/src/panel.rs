@@ -162,6 +162,7 @@ pub struct Panel {
     /// Set by `process_output` each frame; read by attention detection to skip
     /// the expensive `last_lines_text` scan for panels without new content.
     pub(crate) had_recent_output: bool,
+    last_output_at_millis: Option<i64>,
     /// Original launch command (for persistence).
     pub launch_command: Option<String>,
     /// Original launch args (for persistence).
@@ -202,6 +203,13 @@ impl Panel {
         self.had_recent_output
     }
 
+    #[must_use]
+    pub fn had_recent_output_within(&self, window: Duration) -> bool {
+        let window_millis = i64::try_from(window.as_millis()).unwrap_or(i64::MAX);
+        self.last_output_at_millis
+            .is_some_and(|last_output| current_unix_millis().saturating_sub(last_output) <= window_millis)
+    }
+
     /// Convenience accessor for the editor content (if this panel holds one).
     #[must_use]
     pub fn editor(&self) -> Option<&MarkdownEditor> {
@@ -235,6 +243,20 @@ impl Panel {
         spawn_panel(id, workspace_id, opts)
     }
 
+    /// Build a terminal-backed placeholder for a panel that failed to restore.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the placeholder terminal runtime cannot be created.
+    pub(crate) fn restore_failure(
+        id: PanelId,
+        workspace_id: WorkspaceId,
+        opts: PanelOptions,
+        error_message: &str,
+    ) -> Result<Self> {
+        spawn::restore_failure_panel(id, workspace_id, opts, error_message)
+    }
+
     /// Drain pending terminal events. Returns `true` if any output was processed.
     #[profiling::function]
     pub fn process_output(&mut self) -> PanelProcessOutput {
@@ -251,6 +273,9 @@ impl Panel {
             None
         };
         self.had_recent_output = had_output;
+        if had_output {
+            self.last_output_at_millis = Some(current_unix_millis());
+        }
 
         if let Some(title) = terminal_title {
             self.terminal_title = title;
@@ -311,9 +336,18 @@ impl Panel {
         self.content.terminal().is_some_and(Terminal::child_exited)
     }
 
+    /// Returns `true` only when the panel should be auto-removed after its
+    /// child process exits.
+    ///
+    /// SSH panels never auto-close (the user often wants to see the
+    /// disconnection message). For every other kind we keep the panel open
+    /// unless the child reported a *successful* exit (status code `0`):
+    /// a missing binary, crash, or signal kill leaves the panel around so
+    /// the user can read the error instead of having it vanish silently.
     #[must_use]
     pub fn should_close_after_exit(&self) -> bool {
-        !matches!(self.kind, PanelKind::Ssh)
+        let exit_status = self.content.terminal().and_then(Terminal::child_exit_status);
+        should_close_for_exit_status(self.kind, exit_status)
     }
 
     /// Returns `true` if the terminal bell has fired since the last call.
@@ -563,6 +597,13 @@ impl Panel {
     }
 }
 
+fn should_close_for_exit_status(kind: PanelKind, exit_status: Option<std::process::ExitStatus>) -> bool {
+    if matches!(kind, PanelKind::Ssh) {
+        return false;
+    }
+    exit_status.is_some_and(|status| status.success())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -570,7 +611,7 @@ mod tests {
     use super::{
         AGENT_PANEL_SCROLLBACK_LIMIT, AgentSessionBinding, DEFAULT_PANEL_SCROLLBACK_LIMIT, Panel, PanelContent,
         PanelId, PanelKind, PanelLayout, PanelResume, UsageDashboard, WorkspaceId, kitty_keyboard_for_kind,
-        platform_default_shell, resolve_launch_command, scrollback_limit_for_kind,
+        platform_default_shell, resolve_launch_command, scrollback_limit_for_kind, should_close_for_exit_status,
     };
     use crate::ssh::SshConnection;
 
@@ -590,6 +631,7 @@ mod tests {
             launched_at_millis: 0,
             has_custom_name,
             had_recent_output: false,
+            last_output_at_millis: None,
             launch_command: None,
             launch_args: Vec::new(),
             launch_cwd: None,
@@ -638,6 +680,56 @@ mod tests {
         panel.kind = PanelKind::Ssh;
 
         assert!(!panel.should_close_after_exit());
+    }
+
+    #[cfg(unix)]
+    fn exit_status_with_code(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        // Wait status format on Unix: low 8 bits hold the signal (0 here),
+        // next 8 bits hold the exit code.
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status_with_code(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
+
+    #[test]
+    fn agent_panel_with_no_reported_exit_status_stays_open() {
+        // Mirrors the "binary not found" / "child still running" case where
+        // `Terminal::child_exit_status` returns `None`.
+        assert!(!should_close_for_exit_status(PanelKind::Codex, None));
+        assert!(!should_close_for_exit_status(PanelKind::Shell, None));
+    }
+
+    #[test]
+    fn agent_panel_with_failure_exit_stays_open() {
+        // 127 is the canonical "command not found" status from a shell — the
+        // exact case where we don't want the panel to vanish before the user
+        // can read the error.
+        let failure = exit_status_with_code(127);
+        assert!(!should_close_for_exit_status(PanelKind::Codex, Some(failure)));
+        assert!(!should_close_for_exit_status(PanelKind::Gemini, Some(failure)));
+        assert!(!should_close_for_exit_status(PanelKind::Shell, Some(failure)));
+    }
+
+    #[test]
+    fn agent_panel_with_clean_exit_auto_closes() {
+        let success = exit_status_with_code(0);
+        assert!(should_close_for_exit_status(PanelKind::Codex, Some(success)));
+        assert!(should_close_for_exit_status(PanelKind::Claude, Some(success)));
+        assert!(should_close_for_exit_status(PanelKind::Shell, Some(success)));
+    }
+
+    #[test]
+    fn ssh_panels_never_auto_close_regardless_of_exit_status() {
+        let success = exit_status_with_code(0);
+        let failure = exit_status_with_code(1);
+        assert!(!should_close_for_exit_status(PanelKind::Ssh, None));
+        assert!(!should_close_for_exit_status(PanelKind::Ssh, Some(success)));
+        assert!(!should_close_for_exit_status(PanelKind::Ssh, Some(failure)));
     }
 
     #[test]

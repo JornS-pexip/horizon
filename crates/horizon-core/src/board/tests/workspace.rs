@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
-use crate::config::WorkspaceConfig;
-use crate::layout::{TILE_GAP, WS_INNER_PAD};
+use crate::config::{WindowConfig, WorkspaceConfig};
+use crate::layout::{TILE_GAP, WS_COLLISION_GAP, WS_INNER_PAD};
 use crate::panel::{DEFAULT_PANEL_SIZE, PanelKind, PanelOptions, PanelResume};
 use crate::runtime_state::{PanelState, RuntimeState, WorkspaceState, WorkspaceTemplateRef};
 use crate::ssh::{SshConnection, SshConnectionStatus};
+use crate::view::CanvasViewState;
 
 use super::super::*;
 use super::editor_panel_options;
@@ -287,6 +288,116 @@ fn align_workspaces_horizontally_only_moves_selected_workspaces() {
 }
 
 #[test]
+fn move_workspace_beside_places_workspace_tight_to_target() {
+    let mut board = Board::new();
+    let alpha = board.create_workspace("alpha");
+    let beta = board.create_workspace("beta");
+
+    board
+        .create_panel(editor_panel_options(), alpha)
+        .expect("alpha panel should spawn");
+    board
+        .create_panel(editor_panel_options(), beta)
+        .expect("beta panel should spawn");
+
+    assert!(board.move_workspace_beside(beta, alpha, WorkspaceDockSide::Right));
+
+    let alpha_frame = board.workspace_frame_rect(alpha).expect("alpha frame");
+    let beta_frame = board.workspace_frame_rect(beta).expect("beta frame");
+
+    assert!(
+        (beta_frame[0] - (alpha_frame[2] + WS_COLLISION_GAP)).abs() <= f32::EPSILON,
+        "expected beta to sit to the right of alpha with gap {WS_COLLISION_GAP}, got alpha={alpha_frame:?} beta={beta_frame:?}"
+    );
+    assert!(
+        (beta_frame[1] - alpha_frame[1]).abs() <= f32::EPSILON,
+        "expected top edges to align, got alpha={alpha_frame:?} beta={beta_frame:?}"
+    );
+}
+
+#[test]
+fn move_workspace_beside_pushes_colliding_neighbors() {
+    let mut board = Board::new();
+    let alpha = board.create_workspace_at("alpha", [0.0, 40.0]);
+    let beta = board.create_workspace_at("beta", [720.0, 40.0]);
+    let gamma = board.create_workspace_at("gamma", [1440.0, 40.0]);
+
+    for workspace_id in [alpha, beta, gamma] {
+        board
+            .create_panel(editor_panel_options(), workspace_id)
+            .expect("panel should spawn");
+    }
+
+    let beta_before = board.workspace_frame_rect(beta).expect("beta frame before");
+
+    assert!(board.move_workspace_beside(gamma, alpha, WorkspaceDockSide::Right));
+
+    let alpha_frame = board.workspace_frame_rect(alpha).expect("alpha frame");
+    let gamma_frame = board.workspace_frame_rect(gamma).expect("gamma frame");
+    let beta_frame = board.workspace_frame_rect(beta).expect("beta frame");
+
+    assert!(
+        (gamma_frame[0] - (alpha_frame[2] + WS_COLLISION_GAP)).abs() <= f32::EPSILON,
+        "expected gamma to dock next to alpha, got alpha={alpha_frame:?} gamma={gamma_frame:?}"
+    );
+    assert!(
+        beta_frame[0] > gamma_frame[2],
+        "expected beta to be pushed out of gamma's way, got beta={beta_frame:?} gamma={gamma_frame:?}"
+    );
+    assert!(
+        beta_frame[0] > beta_before[0],
+        "expected beta to move right after gamma docked near alpha, got before={beta_before:?} after={beta_frame:?}"
+    );
+}
+
+#[test]
+fn move_workspace_beside_in_scope_ignores_out_of_scope_workspaces() {
+    let mut board = Board::new();
+    let alpha = board.create_workspace_at("alpha", [0.0, 40.0]);
+    let beta = board.create_workspace_at("beta", [720.0, 40.0]);
+    let gamma = board.create_workspace_at("gamma", [1440.0, 40.0]);
+
+    for workspace_id in [alpha, beta, gamma] {
+        board
+            .create_panel(editor_panel_options(), workspace_id)
+            .expect("panel should spawn");
+    }
+
+    let beta_before = board.workspace(beta).expect("beta").position;
+
+    assert!(board.move_workspace_beside_in_scope(gamma, alpha, WorkspaceDockSide::Right, &[alpha, gamma]));
+
+    let alpha_frame = board.workspace_frame_rect(alpha).expect("alpha frame");
+    let gamma_frame = board.workspace_frame_rect(gamma).expect("gamma frame");
+    let beta_after = board.workspace(beta).expect("beta").position;
+
+    assert!(
+        (gamma_frame[0] - (alpha_frame[2] + WS_COLLISION_GAP)).abs() <= f32::EPSILON,
+        "expected gamma to dock next to alpha, got alpha={alpha_frame:?} gamma={gamma_frame:?}"
+    );
+    assert!(
+        vec2_eq(beta_after, beta_before),
+        "expected out-of-scope beta workspace to stay at {beta_before:?}, got {beta_after:?}"
+    );
+}
+
+#[test]
+fn moving_workspace_before_and_after_updates_workspace_order() {
+    let mut board = Board::new();
+    let alpha = board.create_workspace("alpha");
+    let beta = board.create_workspace("beta");
+    let gamma = board.create_workspace("gamma");
+
+    assert!(board.move_workspace_before(gamma, alpha));
+    let order: Vec<_> = board.workspaces.iter().map(|workspace| workspace.id).collect();
+    assert_eq!(order, vec![gamma, alpha, beta]);
+
+    assert!(board.move_workspace_after(alpha, beta));
+    let order: Vec<_> = board.workspaces.iter().map(|workspace| workspace.id).collect();
+    assert_eq!(order, vec![gamma, beta, alpha]);
+}
+
+#[test]
 fn adding_panel_pushes_colliding_workspace() {
     let mut board = Board::new();
     let expanding_workspace = board.create_workspace("expanding");
@@ -411,6 +522,62 @@ fn restored_empty_workspaces_are_removed_during_cleanup() {
 }
 
 #[test]
+fn restored_workspace_layout_is_preserved_after_panel_recreation() {
+    let state = RuntimeState {
+        workspaces: vec![WorkspaceState {
+            local_id: "grid".to_string(),
+            name: "grid".to_string(),
+            cwd: None,
+            position: Some([0.0, 40.0]),
+            template: None,
+            layout: Some(WorkspaceLayout::Grid),
+            panels: vec![
+                PanelState {
+                    local_id: "panel-a".to_string(),
+                    name: "a".to_string(),
+                    kind: PanelKind::Editor,
+                    command: None,
+                    args: Vec::new(),
+                    cwd: None,
+                    ssh_connection: None,
+                    rows: 24,
+                    cols: 80,
+                    resume: PanelResume::Fresh,
+                    position: Some([20.0, 60.0]),
+                    size: Some([320.0, 220.0]),
+                    session_binding: None,
+                    template: None,
+                    editor_content: None,
+                },
+                PanelState {
+                    local_id: "panel-b".to_string(),
+                    name: "b".to_string(),
+                    kind: PanelKind::Editor,
+                    command: None,
+                    args: Vec::new(),
+                    cwd: None,
+                    ssh_connection: None,
+                    rows: 24,
+                    cols: 80,
+                    resume: PanelResume::Fresh,
+                    position: Some([360.0, 60.0]),
+                    size: Some([320.0, 220.0]),
+                    session_binding: None,
+                    template: None,
+                    editor_content: None,
+                },
+            ],
+        }],
+        ..RuntimeState::default()
+    };
+
+    let board = Board::from_runtime_state(&state).expect("board");
+    let workspace = board.workspaces.first().expect("workspace");
+
+    assert_eq!(workspace.layout, Some(WorkspaceLayout::Grid));
+}
+
+#[test]
 fn persisted_ssh_panels_restore_as_disconnected_snapshots() {
     let transcript_root = tempfile::tempdir().expect("tempdir");
     std::fs::write(transcript_root.path().join("ssh-panel.bin"), b"restored ssh prompt\r\n").expect("write transcript");
@@ -455,6 +622,91 @@ fn persisted_ssh_panels_restore_as_disconnected_snapshots() {
         panel.terminal().expect("terminal").last_lines_text(1),
         "restored ssh prompt"
     );
+}
+
+#[test]
+fn runtime_restore_keeps_remaining_panels_when_one_spawn_fails() {
+    let invalid_command = "bad\0codex";
+    let state = RuntimeState {
+        active_workspace_local_id: Some("workspace".to_string()),
+        focused_panel_local_id: Some("broken-codex".to_string()),
+        workspaces: vec![WorkspaceState {
+            local_id: "workspace".to_string(),
+            name: "Workspace".to_string(),
+            cwd: None,
+            position: Some([0.0, 40.0]),
+            template: None,
+            layout: Some(WorkspaceLayout::Grid),
+            panels: vec![
+                PanelState {
+                    local_id: "notes".to_string(),
+                    name: "Notes".to_string(),
+                    kind: PanelKind::Editor,
+                    command: None,
+                    args: Vec::new(),
+                    cwd: None,
+                    ssh_connection: None,
+                    rows: 24,
+                    cols: 80,
+                    resume: PanelResume::Fresh,
+                    position: Some([0.0, 40.0]),
+                    size: Some([320.0, 220.0]),
+                    session_binding: None,
+                    template: None,
+                    editor_content: None,
+                },
+                PanelState {
+                    local_id: "broken-codex".to_string(),
+                    name: "Broken Codex".to_string(),
+                    kind: PanelKind::Codex,
+                    command: Some(invalid_command.to_string()),
+                    args: vec!["--no-alt-screen".to_string()],
+                    cwd: None,
+                    ssh_connection: None,
+                    rows: 24,
+                    cols: 80,
+                    resume: PanelResume::Fresh,
+                    position: Some([360.0, 40.0]),
+                    size: Some([320.0, 220.0]),
+                    session_binding: None,
+                    template: None,
+                    editor_content: None,
+                },
+            ],
+        }],
+        ..RuntimeState::default()
+    };
+
+    let mut board = Board::from_runtime_state(&state).expect("board");
+
+    assert_eq!(board.panels.len(), 2);
+    assert!(board.panel_id_by_local_id("notes").is_some());
+    let failed_panel_id = board
+        .panel_id_by_local_id("broken-codex")
+        .expect("failed panel placeholder");
+    let failed_panel = board.panel(failed_panel_id).expect("failed panel");
+    assert_eq!(failed_panel.kind, PanelKind::Codex);
+    assert_eq!(failed_panel.launch_command.as_deref(), Some(invalid_command));
+    assert_eq!(failed_panel.launch_args, vec!["--no-alt-screen".to_string()]);
+    assert_eq!(board.focused, Some(failed_panel_id));
+    let placeholder_text = failed_panel
+        .terminal()
+        .expect("placeholder terminal")
+        .last_lines_text(24);
+    assert!(placeholder_text.contains("Horizon could not restore this panel"));
+    assert!(board.unresolved_attention_for_panel(failed_panel_id).is_some());
+
+    let saved_state = RuntimeState::from_board(&board, WindowConfig::default(), CanvasViewState::default());
+    let saved_failed_panel = saved_state
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.panels)
+        .find(|panel| panel.local_id == "broken-codex")
+        .expect("saved failed panel");
+    assert_eq!(saved_failed_panel.command.as_deref(), Some(invalid_command));
+    assert_eq!(saved_failed_panel.kind, PanelKind::Codex);
+
+    board.shutdown_terminal_panels();
 }
 
 #[test]
